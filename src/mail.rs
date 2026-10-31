@@ -26,8 +26,19 @@ const DEFAULT_HOST: &str = "smtp.hostinger.com";
 pub struct Mailer {
     from: Mailbox,
     public_url: Option<String>,
-    transport: AsyncSmtpTransport<Tokio1Executor>,
+    transport: Transport,
 }
+
+enum Transport {
+    Smtp(AsyncSmtpTransport<Tokio1Executor>),
+    /// Tests : messages gardés en mémoire (`None` : envoi en échec).
+    #[cfg(test)]
+    Memory(Option<Outbox>),
+}
+
+/// Tests : messages « envoyés » (destinataire, objet, texte).
+#[cfg(test)]
+pub type Outbox = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name)
@@ -73,8 +84,30 @@ impl Mailer {
         Ok(Self {
             from,
             public_url,
-            transport,
+            transport: Transport::Smtp(transport),
         })
+    }
+
+    /// Tests : boîte d'envoi en mémoire.
+    #[cfg(test)]
+    pub fn memory() -> (Self, Outbox) {
+        let outbox = Outbox::default();
+        (Self::fake(Some(outbox.clone())), outbox)
+    }
+
+    /// Tests : chaque envoi échoue.
+    #[cfg(test)]
+    pub fn failing() -> Self {
+        Self::fake(None)
+    }
+
+    #[cfg(test)]
+    fn fake(outbox: Option<Outbox>) -> Self {
+        Self {
+            from: DEFAULT_FROM.parse().expect("expéditeur par défaut"),
+            public_url: None,
+            transport: Transport::Memory(outbox),
+        }
     }
 
     async fn send(&self, to: &str, subject: &str, text: String) -> Result<()> {
@@ -84,12 +117,24 @@ impl Mailer {
             .to(to)
             .subject(subject)
             .header(ContentType::TEXT_PLAIN)
-            .body(text)?;
-        self.transport
-            .send(message)
-            .await
-            .context("le serveur SMTP a refusé l'envoi")?;
+            .body(text.clone())?;
+        match &self.transport {
+            Transport::Smtp(t) => {
+                t.send(message).await.context("le serveur SMTP a refusé l'envoi")?;
+            }
+            #[cfg(test)]
+            Transport::Memory(outbox) => {
+                let _ = message;
+                let Some(outbox) = outbox else { bail!("envoi en échec (test)") };
+                outbox.lock().unwrap().push((to.email.to_string(), subject.to_owned(), text));
+            }
+        }
         Ok(())
+    }
+
+    /// Envoie le code de vérification de l'adresse (inscription).
+    pub async fn send_signup_code(&self, to: &str, code: &str) -> Result<()> {
+        self.send(to, &format!("Votre code Cocon : {code}"), signup_code_text(code)).await
     }
 
     /// Envoie un code d'invitation.
@@ -118,6 +163,17 @@ fn invite_text(public_url: Option<&str>, code: &str, days: u32) -> String {
     )
 }
 
+/// Texte du code de vérification de l'adresse.
+fn signup_code_text(code: &str) -> String {
+    format!(
+        "Bonjour,\n\n\
+         Voici votre code pour confirmer votre adresse et terminer votre inscription à Cocon :\n\n    {code}\n\n\
+         Il est valable {minutes} minutes et ne sert qu'une fois.\n\n\
+         Si vous n'avez pas demandé à créer de compte, ignorez simplement ce message : \
+         sans confirmation, le compte est supprimé.\n",
+        minutes = crate::auth::EMAIL_CODE_TTL.num_minutes()
+    )
+}
 
 /// Contrôle minimal d'une adresse, avant de créer le code.
 pub fn looks_like_email(s: &str) -> bool {

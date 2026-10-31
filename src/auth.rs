@@ -32,6 +32,12 @@ pub const WEB_TTL: chrono::Duration = chrono::Duration::days(7);
 pub const MAX_FAILURES: u32 = 5;
 pub const LOCK_FOR: chrono::Duration = chrono::Duration::minutes(15);
 pub const MIN_PASSWORD_LEN: usize = 12;
+/// Code de vérification de l'adresse (inscription) : durée, essais, renvoi.
+pub const EMAIL_CODE_TTL: chrono::Duration = chrono::Duration::minutes(10);
+pub const EMAIL_CODE_MAX_ATTEMPTS: i32 = 5;
+pub const EMAIL_CODE_RESEND_AFTER: chrono::Duration = chrono::Duration::seconds(60);
+/// Un compte jamais confirmé est supprimé après ce délai.
+pub const UNVERIFIED_TTL: chrono::Duration = chrono::Duration::hours(24);
 
 // ------------------------------------------------------------ mots de passe
 
@@ -113,6 +119,30 @@ pub async fn issue_web_session(db: &Db, device: &str) -> Result<String> {
 }
 
 /// Code d'invitation : (code à transmettre, empreinte stockée).
+/// Code à 6 chiffres envoyé par e-mail, tiré uniformément (rejet des
+/// valeurs qui biaiseraient le modulo).
+pub fn new_email_code() -> String {
+    const LIMIT: u32 = u32::MAX - u32::MAX % 1_000_000;
+    loop {
+        let n = u32::from_le_bytes(random_bytes::<4>());
+        if n < LIMIT {
+            return format!("{:06}", n % 1_000_000);
+        }
+    }
+}
+
+/// Empreinte d'un code e-mail, liée au compte (le même code pour deux
+/// comptes ne donne pas la même empreinte).
+pub fn email_code_hash(user: i64, code: &str) -> String {
+    token_hash(&format!("email-code:{user}:{code}"))
+}
+
+/// Normalise une saisie de code : chiffres seuls (« 482 913 » → « 482913 »).
+pub fn clean_email_code(input: &str) -> Option<String> {
+    let digits: String = input.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+    (digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
+}
+
 pub fn new_invite_code() -> (String, String) {
     new_token("ci_")
 }
@@ -277,6 +307,21 @@ mod tests {
         assert!(a.starts_with("ca_") && a.len() > 40);
         assert_eq!(ah, token_hash(&a));
         assert_eq!(ah.len(), 64);
+    }
+
+    #[test]
+    fn email_codes() {
+        for _ in 0..200 {
+            let c = new_email_code();
+            assert_eq!(c.len(), 6);
+            assert!(c.bytes().all(|b| b.is_ascii_digit()));
+        }
+        assert_eq!(clean_email_code(" 482 913 ").as_deref(), Some("482913"));
+        assert_eq!(clean_email_code("482-913").as_deref(), Some("482913"));
+        for bad in ["", "12345", "1234567", "abcdef", "12345a"] {
+            assert!(clean_email_code(bad).is_none(), "{bad}");
+        }
+        assert_ne!(email_code_hash(1, "123456"), email_code_hash(2, "123456"));
     }
 
     #[test]
