@@ -1,0 +1,149 @@
+//! Envoi d'e-mails en SMTP, directement auprès du serveur de messagerie
+//! de l'expéditeur (aucun service tiers).
+//!
+//! Configuration (`.env`) :
+//! - `COCON_SMTP_HOST` : serveur SMTP (par défaut `smtp.hostinger.com`) ;
+//! - `COCON_SMTP_PORT` : port, 465 (TLS direct, par défaut) ou 587 (STARTTLS) ;
+//! - `COCON_SMTP_TLS` : `tls` ou `starttls` (déduit du port s'il est absent) ;
+//! - `COCON_SMTP_USER` : identifiant (par défaut l'adresse de l'expéditeur) ;
+//! - `COCON_SMTP_PASSWORD` : mot de passe de la boîte (secret) ;
+//! - `COCON_MAIL_FROM` : expéditeur (par défaut `Cocon <contact@tkcb.pro>`) ;
+//! - `COCON_PUBLIC_URL` : adresse de l'interface web, citée dans le message
+//!   (facultatif).
+
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use lettre::message::header::ContentType;
+use lettre::message::Mailbox;
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+
+const DEFAULT_FROM: &str = "Cocon <contact@tkcb.pro>";
+/// Messagerie Hostinger (boîte contact@tkcb.pro).
+const DEFAULT_HOST: &str = "smtp.hostinger.com";
+
+pub struct Mailer {
+    from: Mailbox,
+    public_url: Option<String>,
+    transport: AsyncSmtpTransport<Tokio1Executor>,
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+impl Mailer {
+    /// Lit la configuration ; erreur explicite si un réglage manque.
+    pub fn from_env() -> Result<Self> {
+        let from_raw = env("COCON_MAIL_FROM").unwrap_or_else(|| DEFAULT_FROM.to_owned());
+        let from: Mailbox = from_raw
+            .parse()
+            .with_context(|| format!("COCON_MAIL_FROM invalide : {from_raw}"))?;
+        let host = env("COCON_SMTP_HOST").unwrap_or_else(|| DEFAULT_HOST.to_owned());
+        let password = env("COCON_SMTP_PASSWORD")
+            .context("COCON_SMTP_PASSWORD manquant (variable d'environnement ou fichier .env)")?;
+        let user = env("COCON_SMTP_USER").unwrap_or_else(|| from.email.to_string());
+        let port: u16 = match env("COCON_SMTP_PORT") {
+            Some(p) => p.parse().with_context(|| format!("COCON_SMTP_PORT invalide : {p}"))?,
+            None => 465,
+        };
+        let starttls = match env("COCON_SMTP_TLS").as_deref() {
+            Some("tls") => false,
+            Some("starttls") => true,
+            Some(other) => bail!("COCON_SMTP_TLS invalide : {other} (tls ou starttls)"),
+            None => port != 465,
+        };
+        // TLS obligatoire dans les deux cas : le mot de passe ne circule jamais en clair.
+        let builder = if starttls {
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&host)
+        } else {
+            AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
+        }
+        .with_context(|| format!("serveur SMTP invalide : {host}"))?;
+        let transport = builder
+            .port(port)
+            .credentials(Credentials::new(user, password))
+            .timeout(Some(Duration::from_secs(20)))
+            .build();
+        let public_url = env("COCON_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_owned());
+        Ok(Self {
+            from,
+            public_url,
+            transport,
+        })
+    }
+
+    async fn send(&self, to: &str, subject: &str, text: String) -> Result<()> {
+        let to: Mailbox = to.parse().with_context(|| format!("adresse e-mail invalide : {to}"))?;
+        let message = Message::builder()
+            .from(self.from.clone())
+            .to(to)
+            .subject(subject)
+            .header(ContentType::TEXT_PLAIN)
+            .body(text)?;
+        self.transport
+            .send(message)
+            .await
+            .context("le serveur SMTP a refusé l'envoi")?;
+        Ok(())
+    }
+
+    /// Envoie un code d'invitation.
+    pub async fn send_invite(&self, to: &str, code: &str, days: u32) -> Result<()> {
+        let where_ = match &self.public_url {
+            Some(url) => format!("Rendez-vous sur {url}, choisissez « Inscription »"),
+            None => "Dans l'application Cocon, choisissez « Inscription »".to_owned(),
+        };
+        let text = format!(
+            "Bonjour,\n\n\
+             Vous êtes invité·e à créer un compte Cocon.\n\n\
+             {where_} et saisissez ce code d'invitation :\n\n    {code}\n\n\
+             Il ne sert qu'une fois et reste valable {days} jours.\n\n\
+             Si vous n'attendiez pas cette invitation, ignorez simplement ce message.\n"
+        );
+        self.send(to, "Votre invitation à Cocon", text).await
+    }
+}
+
+/// Contrôle minimal d'une adresse, avant de créer le code.
+pub fn looks_like_email(s: &str) -> bool {
+    let s = s.trim();
+    s.len() <= 254
+        && !s.contains(char::is_whitespace)
+        && s.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_email;
+
+    #[test]
+    fn adresses() {
+        assert!(looks_like_email("ami@exemple.org"));
+        assert!(looks_like_email(" ami@exemple.org "));
+        for bad in [
+            "",
+            "ami",
+            "@exemple.org",
+            "ami@",
+            "ami@exemple",
+            "a mi@exemple.org",
+            "ami@.org",
+            "ami@exemple.",
+        ] {
+            assert!(!looks_like_email(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn expediteur_par_defaut() {
+        let from: lettre::message::Mailbox = super::DEFAULT_FROM.parse().unwrap();
+        assert_eq!(from.email.to_string(), "contact@tkcb.pro");
+    }
+}

@@ -61,6 +61,13 @@ services:
       DATABASE_URL: postgres://cocon_api:${COCON_DB_PASSWORD}@postgres:5432/cocon_api
       COCON_API_BIND: 127.0.0.1:8787
       COCON_API_SIGNUP: ${COCON_API_SIGNUP:-invite}
+      COCON_MAIL_FROM: ${COCON_MAIL_FROM:-Cocon <contact@tkcb.pro>}
+      COCON_SMTP_HOST: ${COCON_SMTP_HOST:-smtp.hostinger.com}
+      COCON_SMTP_PORT: ${COCON_SMTP_PORT:-465}
+      COCON_SMTP_TLS: ${COCON_SMTP_TLS:-}
+      COCON_SMTP_USER: ${COCON_SMTP_USER:-}
+      COCON_SMTP_PASSWORD: ${COCON_SMTP_PASSWORD:-}
+      COCON_PUBLIC_URL: https://${COCON_DOMAIN}
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

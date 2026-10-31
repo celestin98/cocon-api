@@ -8,6 +8,7 @@ mod auth;
 mod db;
 mod hub;
 mod hydration;
+mod mail;
 mod protocol;
 mod routes;
 mod web;
@@ -61,6 +62,10 @@ enum Command {
         /// Validité en jours.
         #[arg(long, default_value_t = 7)]
         days: u32,
+        /// Envoie le code à cette adresse par e-mail (SMTP : voir
+        /// `COCON_SMTP_HOST`, `COCON_SMTP_PASSWORD` et `COCON_MAIL_FROM`).
+        #[arg(long)]
+        email: Option<String>,
     },
     /// Gestion des comptes.
     User {
@@ -253,12 +258,36 @@ async fn admin(db: &Db, command: Command) -> Result<()> {
                 println!("Appareil introuvable ou déjà révoqué.");
             }
         }
-        Command::Invite { days } => {
+        Command::Invite { days, email } => {
+            let days = days.clamp(1, 90);
+            // Configuration vérifiée avant de créer le code.
+            let mailer = match &email {
+                Some(to) => {
+                    if !mail::looks_like_email(to) {
+                        bail!("adresse e-mail invalide : {to}");
+                    }
+                    Some(mail::Mailer::from_env()?)
+                }
+                None => None,
+            };
             let (code, hash) = auth::new_invite_code();
-            let expires = chrono::Utc::now() + chrono::Duration::days(i64::from(days.clamp(1, 90)));
+            let expires = chrono::Utc::now() + chrono::Duration::days(i64::from(days));
             db::create_invite(db, &hash, expires).await?;
             db::audit(db, None, None, None, "invite_created", "").await;
-            println!("Code d'invitation (usage unique, valable {days} jours) :\n  {code}");
+            match (mailer, email) {
+                (Some(mailer), Some(to)) => {
+                    let to = to.trim();
+                    if let Err(e) = mailer.send_invite(to, &code, days).await {
+                        // Le code existe déjà : on l'affiche pour ne pas le perdre.
+                        eprintln!("Échec de l'envoi : {e:#}");
+                        println!("Code d'invitation (usage unique, valable {days} jours) :\n  {code}");
+                        bail!("invitation créée mais non envoyée à {to}");
+                    }
+                    db::audit(db, None, None, None, "invite_sent", to).await;
+                    println!("Invitation envoyée à {to} (usage unique, valable {days} jours).");
+                }
+                _ => println!("Code d'invitation (usage unique, valable {days} jours) :\n  {code}"),
+            }
         }
         Command::Audit { limit } => {
             for line in db::audit_tail(db, limit.min(10_000)).await? {
@@ -269,7 +298,13 @@ async fn admin(db: &Db, command: Command) -> Result<()> {
     Ok(())
 }
 
-async fn serve(db: Db, bind: SocketAddr, insecure_http: bool, behind_proxy: bool, signup: Signup) -> Result<()> {
+async fn serve(
+    db: Db,
+    bind: SocketAddr,
+    insecure_http: bool,
+    behind_proxy: bool,
+    signup: Signup,
+) -> Result<()> {
     if !bind.ip().is_loopback() && !insecure_http && !behind_proxy {
         bail!(
             "refus d'écouter en HTTP sur {bind} : les mots de passe et jetons circuleraient en clair.\n\

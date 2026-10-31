@@ -1280,19 +1280,31 @@ async fn forwarded_for_trusted_only_from_proxy_network() {
     for _ in 0..10 {
         attempt(&app, "172.18.0.5", "198.51.100.1").await;
     }
-    assert_eq!(attempt(&app, "172.18.0.5", "198.51.100.1").await, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(attempt(&app, "172.18.0.5", "198.51.100.2").await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        attempt(&app, "172.18.0.5", "198.51.100.1").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        attempt(&app, "172.18.0.5", "198.51.100.2").await,
+        StatusCode::UNAUTHORIZED
+    );
 
     // Un pair public ne choisit pas son adresse, même avec --behind-proxy.
     for i in 0..10 {
         attempt(&app, "203.0.113.7", &format!("198.51.100.{}", 10 + i)).await;
     }
-    assert_eq!(attempt(&app, "203.0.113.7", "198.51.100.99").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        attempt(&app, "203.0.113.7", "198.51.100.99").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
 
     // Sans l'option, un pair privé n'est pas un proxy de confiance.
     let app = routes::router(routes::AppState::new(db));
     for i in 0..10 {
         attempt(&app, "172.18.0.5", &format!("198.51.100.{}", 10 + i)).await;
     }
-    assert_eq!(attempt(&app, "172.18.0.5", "198.51.100.99").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        attempt(&app, "172.18.0.5", "198.51.100.99").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }

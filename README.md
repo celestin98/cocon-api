@@ -89,6 +89,15 @@ Inscriptions (`COCON_API_SIGNUP` dans `.env`, ou `--signup`) :
 
 Pour un serveur personnel, `invite` ou `closed` une fois votre compte créé.
 
+Pour envoyer les invitations par e-mail (`cocon-api invite --email ami@exemple.org`),
+renseignez dans `.env` le SMTP de la boîte expéditrice (Hostinger par défaut) :
+`COCON_SMTP_PASSWORD` (mot de passe de `contact@tkcb.pro`) et, si besoin,
+`COCON_SMTP_HOST` (par défaut `smtp.hostinger.com`),
+`COCON_SMTP_PORT` (465 en TLS direct, par défaut, ou 587 en STARTTLS),
+`COCON_SMTP_USER` (par défaut l'adresse de l'expéditeur), `COCON_MAIL_FROM` (par défaut `Cocon <contact@tkcb.pro>`) et, au besoin,
+`COCON_PUBLIC_URL` (adresse de l'interface, citée dans le message). La connexion
+est toujours chiffrée. Si l'envoi échoue, le code est affiché pour ne pas être perdu.
+
 ### 4. Service et HTTPS
 
 L'API écoute sur `127.0.0.1:8787` ; un reverse proxy fournit le HTTPS. Avec
@@ -206,7 +215,7 @@ Ouvrez l'adresse du serveur dans un navigateur.
 | `cocon-api user list` | liste les comptes |
 | `cocon-api devices <e-mail>` | liste les appareils |
 | `cocon-api revoke <appareil>` | révoque un appareil |
-| `cocon-api invite [--days N]` | crée un code d'invitation à usage unique |
+| `cocon-api invite [--days N] [--email ADRESSE]` | crée un code d'invitation à usage unique ; avec `--email`, l'envoie par e-mail (SMTP) |
 | `cocon-api audit [--limit N]` | journal d'audit |
 
 ## API (v1)
