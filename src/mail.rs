@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use lettre::message::Mailbox;
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 const DEFAULT_FROM: &str = "Cocon <contact@tkcb.pro>";
@@ -36,10 +37,44 @@ pub struct Mailer {
 }
 
 enum Transport {
-    Smtp(AsyncSmtpTransport<Tokio1Executor>),
+    Smtp(SmtpConfig),
     /// Tests : messages gardés en mémoire (`None` : envoi en échec).
     #[cfg(test)]
     Memory(Option<Outbox>),
+}
+
+/// Serveur SMTP. La connexion est ouverte à chaque envoi, sur une adresse
+/// IPv4 de préférence : dans un conteneur sans IPv6, tenter d'abord l'IPv6
+/// (que publie smtp.hostinger.com) fait attendre jusqu'à l'expiration.
+struct SmtpConfig {
+    host: String,
+    port: u16,
+    starttls: bool,
+    credentials: Credentials,
+}
+
+impl SmtpConfig {
+    async fn transport(&self) -> Result<(AsyncSmtpTransport<Tokio1Executor>, std::net::IpAddr)> {
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((self.host.as_str(), self.port))
+            .await
+            .with_context(|| format!("adresse de {} introuvable (DNS)", self.host))?
+            .collect();
+        let ip = addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or(addrs.first())
+            .with_context(|| format!("aucune adresse pour {}", self.host))?
+            .ip();
+        // Le certificat reste vérifié pour le nom du serveur, pas pour l'IP.
+        let tls = TlsParameters::new(self.host.clone())?;
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(ip.to_string())
+            .port(self.port)
+            .tls(if self.starttls { Tls::Required(tls) } else { Tls::Wrapper(tls) })
+            .credentials(self.credentials.clone())
+            .timeout(Some(Duration::from_secs(10)))
+            .build();
+        Ok((transport, ip))
+    }
 }
 
 /// Tests : messages « envoyés » (destinataire, objet, texte).
@@ -77,17 +112,12 @@ impl Mailer {
             None => port != 465,
         };
         // TLS obligatoire dans les deux cas : le mot de passe ne circule jamais en clair.
-        let builder = if starttls {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&host)
-        } else {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
-        }
-        .with_context(|| format!("serveur SMTP invalide : {host}"))?;
-        let transport = builder
-            .port(port)
-            .credentials(Credentials::new(user, password))
-            .timeout(Some(Duration::from_secs(10)))
-            .build();
+        let transport = SmtpConfig {
+            host: host.clone(),
+            port,
+            starttls,
+            credentials: Credentials::new(user, password),
+        };
         let server = format!("{host}:{port} ({})", if starttls { "STARTTLS" } else { "TLS" });
         let public_url = env("COCON_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_owned());
         Ok(Self {
@@ -132,9 +162,15 @@ impl Mailer {
             .header(ContentType::TEXT_PLAIN)
             .body(text.clone())?;
         match &self.transport {
-            Transport::Smtp(t) => {
+            Transport::Smtp(config) => {
                 let server = &self.server;
-                tokio::time::timeout(SEND_TIMEOUT, t.send(message))
+                let send = async {
+                    let (t, ip) = config.transport().await?;
+                    t.send(message)
+                        .await
+                        .with_context(|| format!("via l'adresse {ip}"))
+                };
+                tokio::time::timeout(SEND_TIMEOUT, send)
                     .await
                     .map_err(|_| {
                         anyhow::anyhow!(

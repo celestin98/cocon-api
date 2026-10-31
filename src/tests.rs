@@ -1725,6 +1725,39 @@ async fn email_code_sends_are_capped() {
         outbox.lock().unwrap().len(),
         crate::auth::EMAIL_CODE_MAX_SENDS as usize
     );
+    // Plafond atteint : erreur explicite (plus de silence).
+    sqlx::query("UPDATE email_codes SET sent = now() - interval '2 minutes'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let r = web(&app, "POST", "/web/signup/resend", None, Some(json!({"email": NEW})), Some(ORIGIN), false).await;
+    assert_eq!((r.status, r.json["error"].as_str()), (StatusCode::FORBIDDEN, Some("code_limit")));
+}
+
+#[tokio::test]
+async fn failed_sends_do_not_count() {
+    let Some((app, db, outbox)) = open_signup().await else {
+        return;
+    };
+    const NEW: &str = "panne-passagere@exemple.org";
+    web(&app, "POST", "/web/signup", None, Some(signup_body(NEW)), Some(ORIGIN), false).await;
+    let first = last_code(&outbox, NEW);
+    // Le SMTP tombe : les renvois échouent sans consommer le plafond…
+    let mut st = routes::AppState::new(db.clone());
+    st.mailer = Some(std::sync::Arc::new(crate::mail::Mailer::failing()));
+    let broken = routes::router(st);
+    for _ in 0..10 {
+        sqlx::query("UPDATE email_codes SET sent = now() - interval '2 minutes'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let r = web(&broken, "POST", "/web/signup/resend", None, Some(json!({"email": NEW})), Some(ORIGIN), false).await;
+        assert_eq!(r.json["error"], "mail_failed");
+    }
+    let id = db::user_by_email(&db, NEW).await.unwrap().unwrap().id;
+    assert_eq!(db::email_code_sends(&db, id).await.unwrap(), 1);
+    // …et laissent l'ancien code valable.
+    assert_eq!(verify(&app, NEW, &first).await.status, StatusCode::CREATED);
 }
 
 #[tokio::test]

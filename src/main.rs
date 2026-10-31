@@ -106,6 +106,8 @@ enum UserCommand {
     Totp { email: String, state: OnOff },
     /// Déverrouille un compte après trop d'échecs.
     Unlock { email: String },
+    /// Supprime un compte et toutes ses données (appareils, tâches…).
+    Delete { email: String },
     /// Liste les comptes.
     List,
 }
@@ -227,17 +229,24 @@ async fn admin(db: &Db, command: Command) -> Result<()> {
                 db::reset_failures(db, u.id).await?;
                 println!("Compte {} déverrouillé.", u.email);
             }
+            UserCommand::Delete { email } => {
+                let u = user_or_fail(db, &email).await?;
+                db::delete_user(db, u.id).await?;
+                db::audit(db, None, None, None, "user_deleted", &u.email).await;
+                println!("Compte {} supprimé.", u.email);
+            }
             UserCommand::List => {
                 for u in db::list_users(db).await? {
                     println!(
-                        "{}  TOTP : {}{}",
+                        "{}  TOTP : {}{}{}",
                         u.email,
                         if u.totp_secret.is_some() { "oui" } else { "non" },
                         if u.locked_until.is_some_and(|t| t > chrono::Utc::now()) {
                             "  (verrouillé)"
                         } else {
                             ""
-                        }
+                        },
+                        if u.email_verified { "" } else { "  (adresse non confirmée)" }
                     );
                 }
             }

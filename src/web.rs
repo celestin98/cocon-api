@@ -262,15 +262,20 @@ fn same_origin_or_403(headers: &HeaderMap) -> ApiResult<()> {
     }
 }
 
-/// Nouveau code pour un compte en attente : enregistré (haché), puis envoyé.
-/// `Ok(false)` si le nombre maximal d'envois est atteint.
+/// Nouveau code pour un compte en attente : envoyé, puis enregistré (haché).
+/// Un envoi raté ne compte pas dans le plafond et laisse l'ancien code
+/// valable. `Ok(false)` si le nombre maximal d'envois est atteint.
 async fn send_code(
     state: &AppState,
     mailer: &crate::mail::Mailer,
     user: i64,
     email: &str,
 ) -> anyhow::Result<bool> {
+    if db::email_code_sends(&state.db, user).await? >= auth::EMAIL_CODE_MAX_SENDS {
+        return Ok(false);
+    }
     let code = auth::new_email_code();
+    mailer.send_signup_code(email, &code).await?;
     let expires = Utc::now() + auth::EMAIL_CODE_TTL;
     if !db::set_email_code(
         &state.db,
@@ -283,8 +288,17 @@ async fn send_code(
     {
         return Ok(false);
     }
-    mailer.send_signup_code(email, &code).await?;
+    tracing::info!("code de vérification envoyé à {email}");
     Ok(true)
+}
+
+fn code_limit() -> Error {
+    Error::new(
+        StatusCode::FORBIDDEN,
+        "code_limit",
+        "Trop de codes ont été envoyés à cette adresse. L'inscription en attente sera \
+         effacée sous 24 heures : vous pourrez alors recommencer.",
+    )
 }
 
 /// Renvoie un code si le précédent date d'au moins une minute.
@@ -296,10 +310,15 @@ async fn resend_if_due(state: &AppState, user: &db::UserRow) -> ApiResult<()> {
         .await?
         .is_none_or(|sent| Utc::now() - sent >= auth::EMAIL_CODE_RESEND_AFTER);
     if !due {
+        tracing::info!("code pour {} non renvoyé : le précédent a moins d'une minute", user.email);
         return Ok(());
     }
     match send_code(state, &mailer, user.id, &user.email).await {
-        Ok(_) => Ok(()),
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!("code pour {} non renvoyé : plafond d'envois atteint", user.email);
+            Err(code_limit())
+        }
         Err(e) => {
             tracing::warn!("code de vérification non envoyé à {} : {e:#}", user.email);
             Err(mail_failed())

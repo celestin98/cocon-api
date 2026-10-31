@@ -373,6 +373,17 @@ pub async fn set_email_code(
     .is_some())
 }
 
+/// Nombre de codes déjà envoyés à ce compte (0 si aucun).
+pub async fn email_code_sends(db: &Db, user: i64) -> Result<i32> {
+    Ok(sqlx::query("SELECT sends FROM email_codes WHERE user_id = $1")
+        .bind(user)
+        .fetch_optional(&db.pool)
+        .await?
+        .map(|r| r.try_get("sends"))
+        .transpose()?
+        .unwrap_or(0))
+}
+
 /// Date d'envoi du dernier code (limite les renvois).
 pub async fn email_code_sent(db: &Db, user: i64) -> Result<Option<DateTime<Utc>>> {
     Ok(sqlx::query("SELECT sent FROM email_codes WHERE user_id = $1")
