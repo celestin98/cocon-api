@@ -23,5 +23,8 @@ ENV COCON_API_BIND=0.0.0.0:8787 \
     COCON_API_BEHIND_PROXY=true \
     COCON_API_SIGNUP=invite
 EXPOSE 8787
+# Sans shell ni curl dans l'image : le binaire vérifie lui-même /health.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["cocon-api", "health"]
 ENTRYPOINT ["cocon-api"]
 CMD ["serve"]

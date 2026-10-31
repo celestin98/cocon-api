@@ -57,6 +57,13 @@ enum Command {
         #[arg(long, env = "COCON_API_SIGNUP", value_enum, default_value_t = Signup::Open)]
         signup: Signup,
     },
+    /// Vérifie que le serveur local répond (healthcheck Docker/Coolify :
+    /// l'image n'a ni shell ni curl). Code de sortie 0 si `/health` répond.
+    Health {
+        /// Adresse d'écoute du serveur à interroger.
+        #[arg(long, env = "COCON_API_BIND", default_value = "127.0.0.1:8787")]
+        bind: SocketAddr,
+    },
     /// Crée un code d'invitation (inscription en mode « invite »).
     Invite {
         /// Validité en jours.
@@ -160,7 +167,7 @@ async fn user_or_fail(db: &Db, email: &str) -> Result<db::UserRow> {
 
 async fn admin(db: &Db, command: Command) -> Result<()> {
     match command {
-        Command::Serve { .. } => unreachable!(),
+        Command::Serve { .. } | Command::Health { .. } => unreachable!(),
         Command::User { command } => match command {
             UserCommand::Add { email } => {
                 let email = email.trim().to_lowercase();
@@ -359,6 +366,31 @@ async fn serve(
     Ok(())
 }
 
+/// `GET /health` en HTTP brut sur la boucle locale, sans dépendance.
+fn health(bind: SocketAddr) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
+    use std::time::Duration;
+
+    let mut addr = bind;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(if addr.is_ipv4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() });
+    }
+    let timeout = Duration::from_secs(3);
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).with_context(|| format!("{addr} injoignable"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+    let mut head = [0u8; 64];
+    let n = stream.read(&mut head)?;
+    let line = String::from_utf8_lossy(&head[..n]);
+    if line.starts_with("HTTP/1.1 200") {
+        Ok(())
+    } else {
+        bail!("réponse inattendue : {}", line.lines().next().unwrap_or_default())
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -375,6 +407,9 @@ fn main() -> Result<()> {
     // tous dans la liste des processus).
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
+    if let Command::Health { bind } = cli.command {
+        return health(bind);
+    }
     let Some(url) = cli.database_url else {
         bail!("DATABASE_URL manquant (variable d'environnement ou fichier .env)");
     };
