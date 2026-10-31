@@ -358,6 +358,8 @@ function accueil() {
     tabs[autre].focus();
   });
 
+  const ordre = { connexion: 0, inscription: 1, verification: 2 };
+  let precedent = null;
   function afficher(mode) {
     if (mode === "inscription" && !inscriptionOuverte) mode = "connexion";
     // L'étape de vérification prolonge l'onglet « Inscription ».
@@ -375,6 +377,12 @@ function accueil() {
         : mode === "verification"
           ? formVerification(partage, afficher)
           : formInscription(partage, afficher, codeInvite);
+    // Pas d'animation au premier affichage ; ensuite, dans le sens du parcours.
+    if (precedent !== null && precedent !== mode) {
+      f.el.classList.add("passage");
+      f.el.style.setProperty("--depart", ordre[mode] > ordre[precedent] ? "18px" : "-18px");
+    }
+    precedent = mode;
     panneau.replaceChildren(f.el);
     queueMicrotask(() => f.focus());
     // L'adresse de la page reflète le formulaire affiché (lien partageable).
@@ -418,6 +426,7 @@ function formConnexion(partage, afficher) {
           return;
         }
         submit.disabled = true;
+        submit.classList.add("charge");
         form.setAttribute("aria-busy", "true");
         try {
           state.me = await api("POST", "/web/login", {
@@ -439,6 +448,7 @@ function formConnexion(partage, afficher) {
           }
         } finally {
           submit.disabled = false;
+          submit.classList.remove("charge");
           form.removeAttribute("aria-busy");
         }
       },
@@ -552,7 +562,9 @@ function formInscription(partage, afficher, codeInvite) {
         if (premier) return premier.focus();
 
         submit.disabled = true;
-        submit.textContent = "Création du compte…";
+
+        submit.classList.add("charge");
+        submit.textContent = "Création du compte et envoi du code…";
         form.setAttribute("aria-busy", "true");
         try {
           const r = await api("POST", "/web/signup", {
@@ -613,6 +625,7 @@ function formInscription(partage, afficher, codeInvite) {
           }
         } finally {
           submit.disabled = false;
+          submit.classList.remove("charge");
           submit.textContent = "Créer mon compte";
           form.removeAttribute("aria-busy");
         }
@@ -641,6 +654,15 @@ function formInscription(partage, afficher, codeInvite) {
     el: form,
     focus: () => (surInvitation && !invite.input.value ? invite.input : email.input.value ? pw : email.input).focus(),
   };
+}
+
+const mouvementReduit = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/// Relance une animation CSS ponctuelle (classe retirée puis remise).
+function rejouer(el, classe) {
+  el.classList.remove(classe);
+  void el.offsetWidth;
+  el.classList.add(classe);
 }
 
 /// Étape 2 de l'inscription : le code à 6 chiffres reçu par e-mail.
@@ -682,9 +704,11 @@ function formVerification(partage, afficher) {
   renvoi.addEventListener("click", async () => {
     error.textContent = "";
     renvoi.disabled = true;
+    renvoi.classList.add("charge");
     try {
       await api("POST", "/web/signup/resend", { email: adresse });
       statut.textContent = `Nouveau code envoyé à ${adresse}.`;
+      rejouer(statut, "apparait");
       code.input.value = "";
       code.erreur(null);
       code.input.focus();
@@ -693,6 +717,7 @@ function formVerification(partage, afficher) {
       error.textContent =
         err.status === 429 ? "Trop de tentatives depuis cette connexion. Réessayez dans quelques minutes." : err.message;
     } finally {
+      renvoi.classList.remove("charge");
       majRenvoi();
     }
   });
@@ -708,16 +733,25 @@ function formVerification(partage, afficher) {
     }
     envoiEnCours = true;
     submit.disabled = true;
+    submit.classList.add("charge");
     submit.textContent = "Vérification…";
     form.setAttribute("aria-busy", "true");
     try {
       state.me = await api("POST", "/web/signup/verify", { email: adresse, code: chiffres() });
+      // Un instant pour voir la confirmation avant d'entrer dans l'espace.
+      submit.classList.remove("charge");
+      submit.classList.add("reussi");
+      submit.textContent = "Adresse confirmée";
+      code.input.setAttribute("aria-invalid", "false");
+      if (!mouvementReduit()) await new Promise((r) => setTimeout(r, 700));
       history.replaceState(null, "", location.pathname);
       allerA("accueil");
+      return;
     } catch (err) {
       switch (err.code) {
         case "invalid_code":
           code.erreur("Code incorrect. Vérifiez les 6 chiffres reçus.");
+          rejouer(code.input, "tremble");
           code.input.select();
           break;
         case "code_expired":
@@ -731,6 +765,7 @@ function formVerification(partage, afficher) {
     } finally {
       envoiEnCours = false;
       submit.disabled = false;
+      submit.classList.remove("charge");
       submit.textContent = "Valider";
       form.removeAttribute("aria-busy");
     }

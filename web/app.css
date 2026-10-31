@@ -130,6 +130,78 @@ a.bouton { color: var(--encre); text-decoration: none; }
 .bouton:hover { background: var(--carte-douce); border-color: var(--lavande-forte); }
 .bouton:disabled { opacity: 0.5; cursor: default; }
 
+/* Chargement : la lune du logo passe par ses phases devant le libellé.
+ * Un disque d'ombre (le centre du dégradé) traverse le disque éclairé :
+ * pleine lune, croissant, nouvelle lune, et retour. Sans mouvement, elle
+ * reste en croissant, comme sur le logo. */
+@property --phase {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: 78%;
+}
+
+.bouton.charge,
+.bouton.charge:disabled { opacity: 1; cursor: progress; }
+
+.bouton.charge::before {
+  content: "";
+  flex: none;
+  width: 1.1em;
+  height: 1.1em;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px currentColor;
+  background: radial-gradient(circle at var(--phase) 42%, transparent 0 0.5em, currentColor calc(0.5em + 0.5px));
+  animation: phases 2.4s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+@keyframes phases {
+  from { --phase: -60%; }
+  to { --phase: 160%; }
+}
+
+/* Adresse confirmée : le bouton passe au vert, la coche s'inscrit. */
+.bouton.principal.reussi,
+.bouton.principal.reussi:disabled {
+  opacity: 1;
+  background: var(--vert);
+  transition: background-color 240ms ease;
+}
+
+.bouton.reussi::before {
+  content: "";
+  flex: none;
+  width: 0.38em;
+  height: 0.7em;
+  margin: -0.2em 0.1em 0 0;
+  border: solid currentColor;
+  border-width: 0 2px 2px 0;
+  rotate: 45deg;
+  animation: inscrit 380ms cubic-bezier(0.3, 1.4, 0.5, 1) both;
+}
+
+@keyframes inscrit {
+  from { opacity: 0; scale: 0.3; }
+}
+
+/* Mauvais code : le champ tremble, brièvement. */
+@keyframes tremble {
+  20%, 60% { translate: -6px 0; }
+  40%, 80% { translate: 5px 0; }
+}
+
+.tremble { animation: tremble 340ms ease; }
+
+/* Changement d'étape (Connexion, Inscription, Code) : le formulaire glisse
+ * dans le sens du parcours. */
+@keyframes passage {
+  from { opacity: 0; translate: var(--depart, 18px) 0; }
+}
+
+.formulaire-panneau > .passage { animation: passage 380ms cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+
+/* Message bref (« Nouveau code envoyé ») : apparaît en fondu. */
+.apparait { animation: fondu 300ms ease both; }
+
 .bouton.principal {
   border-color: transparent;
   background: var(--encre);
