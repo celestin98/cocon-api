@@ -42,6 +42,8 @@ pub fn router() -> Router<AppState> {
         .route("/fonts/display-700.otf", get(|| font(FONT_BOLD)))
         .route("/web/info", get(info))
         .route("/web/signup", post(signup))
+        .route("/web/signup/verify", post(verify_email))
+        .route("/web/signup/resend", post(resend_code))
         .route("/web/login", post(login))
         .route("/web/logout", post(logout))
         .route("/web/password", post(change_password))
@@ -164,6 +166,30 @@ async fn signup(
         .await
         .map_err(|e| anyhow::anyhow!(e))??;
 
+    // Inscription libre : compte en attente, code à 6 chiffres par e-mail.
+    if let (SignupMode::Open, Some(mailer)) = (state.signup, state.mailer.clone()) {
+        let Some(id) = db::create_unverified_user(&state.db, &email, &hash).await? else {
+            audit(
+                &state,
+                None,
+                None,
+                ip,
+                "signup_failed",
+                "adresse déjà utilisée".into(),
+            );
+            return Err(email_taken());
+        };
+        if let Err(e) = send_code(&state, &mailer, id, &email).await {
+            // Sans code, le compte ne pourrait jamais être confirmé.
+            tracing::warn!("code de vérification non envoyé à {email} : {e:#}");
+            db::delete_user(&state.db, id).await?;
+            audit(&state, None, None, ip, "signup_mail_failed", email);
+            return Err(mail_failed());
+        }
+        audit(&state, Some(id), None, ip, "signup_pending", email.clone());
+        return Ok((StatusCode::ACCEPTED, Json(SignupPending { email, verify: true })).into_response());
+    }
+
     let created = match state.signup {
         SignupMode::Invite => {
             let code = req.invite.as_deref().map(str::trim).unwrap_or_default();
@@ -197,11 +223,7 @@ async fn signup(
             "signup_failed",
             "adresse déjà utilisée".into(),
         );
-        return Err(Error::new(
-            StatusCode::CONFLICT,
-            "email_taken",
-            "Un compte existe déjà avec cette adresse",
-        ));
+        return Err(email_taken());
     };
     audit(&state, Some(id), None, ip, "signup", email.clone());
     let user = db::user_by_id(&state.db, id)
@@ -210,6 +232,173 @@ async fn signup(
     let mut resp = open_session(&state, &user, &headers).await?;
     *resp.status_mut() = StatusCode::CREATED;
     Ok(resp)
+}
+
+fn email_taken() -> Error {
+    Error::new(
+        StatusCode::CONFLICT,
+        "email_taken",
+        "Un compte existe déjà avec cette adresse",
+    )
+}
+
+fn mail_failed() -> Error {
+    Error::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "mail_failed",
+        "Impossible d'envoyer le code de confirmation pour le moment. Réessayez plus tard.",
+    )
+}
+
+fn same_origin_or_403(headers: &HeaderMap) -> ApiResult<()> {
+    if routes::same_origin(headers) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            StatusCode::FORBIDDEN,
+            "csrf",
+            "Requête refusée : origine non autorisée",
+        ))
+    }
+}
+
+/// Nouveau code pour un compte en attente : enregistré (haché), puis envoyé.
+/// `Ok(false)` si le nombre maximal d'envois est atteint.
+async fn send_code(
+    state: &AppState,
+    mailer: &crate::mail::Mailer,
+    user: i64,
+    email: &str,
+) -> anyhow::Result<bool> {
+    let code = auth::new_email_code();
+    let expires = Utc::now() + auth::EMAIL_CODE_TTL;
+    if !db::set_email_code(
+        &state.db,
+        user,
+        &auth::email_code_hash(user, &code),
+        expires,
+        auth::EMAIL_CODE_MAX_SENDS,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    mailer.send_signup_code(email, &code).await?;
+    Ok(true)
+}
+
+/// Renvoie un code si le précédent date d'au moins une minute.
+async fn resend_if_due(state: &AppState, user: &db::UserRow) -> ApiResult<()> {
+    let Some(mailer) = state.mailer.clone() else {
+        return Ok(());
+    };
+    let due = db::email_code_sent(&state.db, user.id)
+        .await?
+        .is_none_or(|sent| Utc::now() - sent >= auth::EMAIL_CODE_RESEND_AFTER);
+    if !due {
+        return Ok(());
+    }
+    match send_code(state, &mailer, user.id, &user.email).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!("code de vérification non envoyé à {} : {e:#}", user.email);
+            Err(mail_failed())
+        }
+    }
+}
+
+/// Étape 2 de l'inscription : le code reçu confirme l'adresse et ouvre la session.
+async fn verify_email(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    headers: HeaderMap,
+    Json(req): Json<VerifyEmailRequest>,
+) -> ApiResult<Response> {
+    same_origin_or_403(&headers)?;
+    if !state.code_limiter.allow(ip) {
+        return Err(Error::too_many());
+    }
+    let Some(code) = auth::clean_email_code(&req.code) else {
+        return Err(Error::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_code",
+            "Le code se compose de 6 chiffres",
+        ));
+    };
+    let expired = || {
+        Error::new(
+            StatusCode::BAD_REQUEST,
+            "code_expired",
+            "Ce code a expiré ou a été trop souvent mal saisi : demandez-en un nouveau",
+        )
+    };
+    let email = req.email.trim().to_lowercase();
+    // Compte inconnu ou déjà confirmé : même réponse qu'un code périmé.
+    let Some(user) = db::user_by_email(&state.db, &email)
+        .await?
+        .filter(|u| !u.email_verified)
+    else {
+        return Err(expired());
+    };
+    match db::check_email_code(
+        &state.db,
+        user.id,
+        &auth::email_code_hash(user.id, &code),
+        auth::EMAIL_CODE_MAX_ATTEMPTS,
+    )
+    .await?
+    {
+        db::EmailCodeCheck::Verified => {
+            audit(
+                &state,
+                Some(user.id),
+                None,
+                ip,
+                "email_verified",
+                user.email.clone(),
+            );
+            let mut resp = open_session(&state, &user, &headers).await?;
+            *resp.status_mut() = StatusCode::CREATED;
+            Ok(resp)
+        }
+        db::EmailCodeCheck::Invalid => {
+            audit(
+                &state,
+                Some(user.id),
+                None,
+                ip,
+                "email_code_invalid",
+                String::new(),
+            );
+            Err(Error::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_code",
+                "Code incorrect",
+            ))
+        }
+        db::EmailCodeCheck::Expired => Err(expired()),
+    }
+}
+
+/// « Renvoyer le code » : toujours 204, que le compte existe ou non.
+async fn resend_code(
+    State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
+    headers: HeaderMap,
+    Json(req): Json<ResendCodeRequest>,
+) -> ApiResult<StatusCode> {
+    same_origin_or_403(&headers)?;
+    if !state.code_limiter.allow(ip) {
+        return Err(Error::too_many());
+    }
+    let email = req.email.trim().to_lowercase();
+    if let Some(user) = db::user_by_email(&state.db, &email)
+        .await?
+        .filter(|u| !u.email_verified)
+    {
+        resend_if_due(&state, &user).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn login(
@@ -225,7 +414,19 @@ async fn login(
             "Requête refusée : origine non autorisée",
         ));
     }
-    let user = routes::check_credentials(&state, ip, &req.email, &req.password, req.totp.as_deref()).await?;
+    let user =
+        match routes::check_credentials(&state, ip, &req.email, &req.password, req.totp.as_deref()).await {
+            Ok(user) => user,
+            Err(e) if e.code() == "email_unverified" => {
+                // Bon mot de passe, adresse pas encore confirmée : nouveau code,
+                // l'interface passe à l'étape de vérification.
+                if let Some(user) = db::user_by_email(&state.db, &req.email.trim().to_lowercase()).await? {
+                    resend_if_due(&state, &user).await?;
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
     audit(
         &state,
         Some(user.id),

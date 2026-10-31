@@ -319,6 +319,18 @@ async fn serve(
              ou --behind-proxy si un proxy HTTPS le joint par un réseau privé (Docker)."
         );
     }
+    // Inscription libre : chaque adresse est confirmée par un code envoyé
+    // par e-mail. Sans SMTP, des comptes resteraient impossibles à confirmer.
+    let signup: protocol::SignupMode = signup.into();
+    let mailer = if signup == protocol::SignupMode::Open {
+        let m = mail::Mailer::from_env().context(
+            "inscription libre (COCON_API_SIGNUP=open) : configurez l'envoi des codes par e-mail \
+             (COCON_SMTP_PASSWORD, voir README), ou choisissez COCON_API_SIGNUP=invite ou closed",
+        )?;
+        Some(std::sync::Arc::new(m))
+    } else {
+        None
+    };
     if db::list_users(&db).await?.is_empty() {
         tracing::warn!("aucun compte : créez-en un avec « cocon-api user add <e-mail> »");
     }
@@ -335,6 +347,11 @@ async fn serve(
                     Ok(_) => {}
                     Err(e) => tracing::warn!("ménage des jetons : {e:#}"),
                 }
+                match db::purge_unverified(&db, auth::UNVERIFIED_TTL).await {
+                    Ok(n) if n > 0 => tracing::info!("{n} compte(s) jamais confirmé(s) supprimé(s)"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("ménage des comptes non confirmés : {e:#}"),
+                }
                 if let Err(e) = db::purge_hydration_log(&db, hydration::LOG_RETENTION_DAYS).await {
                     tracing::warn!("ménage de l'historique d'hydratation : {e:#}");
                 }
@@ -343,7 +360,8 @@ async fn serve(
     }
 
     let mut state = routes::AppState::new(db);
-    state.signup = signup.into();
+    state.signup = signup;
+    state.mailer = mailer;
     state.behind_proxy = behind_proxy;
     tracing::info!("inscriptions : {:?}", state.signup);
     hydration::spawn(state.clone());
@@ -374,10 +392,15 @@ fn health(bind: SocketAddr) -> Result<()> {
 
     let mut addr = bind;
     if addr.ip().is_unspecified() {
-        addr.set_ip(if addr.is_ipv4() { Ipv4Addr::LOCALHOST.into() } else { Ipv6Addr::LOCALHOST.into() });
+        addr.set_ip(if addr.is_ipv4() {
+            Ipv4Addr::LOCALHOST.into()
+        } else {
+            Ipv6Addr::LOCALHOST.into()
+        });
     }
     let timeout = Duration::from_secs(3);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).with_context(|| format!("{addr} injoignable"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).with_context(|| format!("{addr} injoignable"))?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;

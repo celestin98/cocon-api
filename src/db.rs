@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS invites (
     expires TIMESTAMPTZ NOT NULL,
     used_by BIGINT REFERENCES users(id) ON DELETE SET NULL
 );
+-- Inscription libre : adresse confirmée par un code à 6 chiffres envoyé
+-- par e-mail. Les comptes existants (créés avant) sont considérés confirmés.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT true;
+CREATE TABLE IF NOT EXISTS email_codes (
+    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    hash TEXT NOT NULL,
+    expires TIMESTAMPTZ NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    sends INTEGER NOT NULL DEFAULT 1,
+    sent TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 -- Hydratation : réglages (JSON validé), horloge des rappels, verres bus.
 CREATE TABLE IF NOT EXISTS hydration (
     user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -87,6 +98,14 @@ CREATE TABLE IF NOT EXISTS hydration_log (
     at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS hydration_log_user_at ON hydration_log (user_id, at);
+-- Prises en millilitres, identifiées par l'appareil qui les a notées
+-- (synchronisation sans doublon avec le journal local du PC).
+ALTER TABLE hydration_log ADD COLUMN IF NOT EXISTS ml INTEGER NOT NULL DEFAULT 250;
+ALTER TABLE hydration_log ADD COLUMN IF NOT EXISTS client_id TEXT NOT NULL DEFAULT gen_random_uuid()::text;
+CREATE UNIQUE INDEX IF NOT EXISTS hydration_log_client ON hydration_log (user_id, client_id);
+-- Réglages choisis par l'utilisateur (les comptes existants : oui).
+ALTER TABLE hydration ADD COLUMN IF NOT EXISTS configured BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE hydration ALTER COLUMN configured SET DEFAULT false;
 CREATE TABLE IF NOT EXISTS audit (
     id BIGSERIAL PRIMARY KEY,
     at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -144,6 +163,19 @@ pub struct UserRow {
     pub totp_pending: Option<String>,
     pub totp_last_step: u64,
     pub locked_until: Option<DateTime<Utc>>,
+    /// Faux tant que le code reçu par e-mail n'a pas été saisi.
+    pub email_verified: bool,
+}
+
+/// Résultat de la saisie d'un code de vérification d'adresse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailCodeCheck {
+    /// Bon code : adresse confirmée, code supprimé.
+    Verified,
+    /// Mauvais code (essai compté).
+    Invalid,
+    /// Aucun code en cours, expiré ou trop d'essais : en demander un autre.
+    Expired,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +303,7 @@ impl Db {
 /// Colonnes lues (macro : les requêtes restent des littéraux, voir `concat!`).
 macro_rules! user_cols {
     () => {
-        "id, email, pw_hash, totp_secret, totp_pending, totp_last_step, locked_until"
+        "id, email, pw_hash, totp_secret, totp_pending, totp_last_step, locked_until, email_verified"
     };
 }
 
@@ -284,6 +316,7 @@ fn user_row(r: &sqlx::postgres::PgRow) -> Result<UserRow> {
         totp_pending: r.try_get("totp_pending")?,
         totp_last_step: r.try_get::<i64, _>("totp_last_step")?.max(0) as u64,
         locked_until: r.try_get("locked_until")?,
+        email_verified: r.try_get("email_verified")?,
     })
 }
 
@@ -298,6 +331,111 @@ pub async fn create_user(db: &Db, email: &str, pw_hash: &str) -> Result<i64> {
         Some(row) => Ok(row.try_get("id")?),
         None => bail!("le compte {email} existe déjà"),
     }
+}
+
+/// Inscription libre : compte en attente de confirmation de l'adresse.
+/// `None` si l'adresse est déjà prise.
+pub async fn create_unverified_user(db: &Db, email: &str, pw_hash: &str) -> Result<Option<i64>> {
+    let r = sqlx::query(
+        "INSERT INTO users (email, pw_hash, email_verified) VALUES ($1, $2, false)
+         ON CONFLICT DO NOTHING RETURNING id",
+    )
+    .bind(email)
+    .bind(pw_hash)
+    .fetch_optional(&db.pool)
+    .await?;
+    r.map(|row| row.try_get("id")).transpose().map_err(Into::into)
+}
+
+/// Enregistre un nouveau code (remplace le précédent, essais remis à zéro).
+/// Faux si `max_sends` codes ont déjà été envoyés à ce compte : le nombre
+/// total d'essais reste borné, même en redemandant des codes.
+pub async fn set_email_code(
+    db: &Db,
+    user: i64,
+    hash: &str,
+    expires: DateTime<Utc>,
+    max_sends: i32,
+) -> Result<bool> {
+    Ok(sqlx::query(
+        "INSERT INTO email_codes (user_id, hash, expires) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id) DO UPDATE
+            SET hash = $2, expires = $3, attempts = 0, sent = now(), sends = email_codes.sends + 1
+            WHERE email_codes.sends < $4
+         RETURNING sends",
+    )
+    .bind(user)
+    .bind(hash)
+    .bind(expires)
+    .bind(max_sends)
+    .fetch_optional(&db.pool)
+    .await?
+    .is_some())
+}
+
+/// Date d'envoi du dernier code (limite les renvois).
+pub async fn email_code_sent(db: &Db, user: i64) -> Result<Option<DateTime<Utc>>> {
+    Ok(sqlx::query("SELECT sent FROM email_codes WHERE user_id = $1")
+        .bind(user)
+        .fetch_optional(&db.pool)
+        .await?
+        .map(|r| r.try_get("sent"))
+        .transpose()?)
+}
+
+/// Vérifie un code, atomiquement (ligne verrouillée) : deux essais
+/// simultanés ne dépassent pas le nombre d'essais permis.
+pub async fn check_email_code(db: &Db, user: i64, hash: &str, max_attempts: i32) -> Result<EmailCodeCheck> {
+    let mut tx = db.pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT hash, expires > now() AS live, attempts FROM email_codes WHERE user_id = $1 FOR UPDATE",
+    )
+    .bind(user)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Ok(EmailCodeCheck::Expired);
+    };
+    let (stored, live, attempts): (String, bool, i32) = (
+        row.try_get("hash")?,
+        row.try_get("live")?,
+        row.try_get("attempts")?,
+    );
+    // Ligne gardée (compteur d'envois) : seul un nouveau code la ranime.
+    if !live || attempts >= max_attempts {
+        tx.rollback().await?;
+        return Ok(EmailCodeCheck::Expired);
+    }
+    if stored != hash {
+        sqlx::query("UPDATE email_codes SET attempts = attempts + 1 WHERE user_id = $1")
+            .bind(user)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        return Ok(EmailCodeCheck::Invalid);
+    }
+    sqlx::query("DELETE FROM email_codes WHERE user_id = $1")
+        .bind(user)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE users SET email_verified = true WHERE id = $1")
+        .bind(user)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(EmailCodeCheck::Verified)
+}
+
+/// Supprime les comptes jamais confirmés, créés il y a plus de `older_than`.
+pub async fn purge_unverified(db: &Db, older_than: chrono::Duration) -> Result<u64> {
+    Ok(
+        sqlx::query("DELETE FROM users WHERE NOT email_verified AND created < $1")
+            .bind(Utc::now() - older_than)
+            .execute(&db.pool)
+            .await?
+            .rows_affected(),
+    )
 }
 
 pub async fn user_by_email(db: &Db, email: &str) -> Result<Option<UserRow>> {
@@ -662,6 +800,7 @@ pub struct HydrationRow {
     pub settings: String,
     pub last_reminder: Option<DateTime<Utc>>,
     pub last_drink: Option<DateTime<Utc>>,
+    pub configured: bool,
 }
 
 fn hydration_row(r: &sqlx::postgres::PgRow) -> Result<HydrationRow> {
@@ -670,23 +809,27 @@ fn hydration_row(r: &sqlx::postgres::PgRow) -> Result<HydrationRow> {
         settings: r.try_get("settings")?,
         last_reminder: r.try_get("last_reminder")?,
         last_drink: r.try_get("last_drink")?,
+        configured: r.try_get("configured")?,
     })
 }
 
 pub async fn hydration(db: &Db, user: i64) -> Result<Option<HydrationRow>> {
-    sqlx::query("SELECT user_id, settings, last_reminder, last_drink FROM hydration WHERE user_id = $1")
-        .bind(user)
-        .fetch_optional(&db.pool)
-        .await?
-        .map(|r| hydration_row(&r))
-        .transpose()
+    sqlx::query(
+        "SELECT user_id, settings, last_reminder, last_drink, configured FROM hydration WHERE user_id = $1",
+    )
+    .bind(user)
+    .fetch_optional(&db.pool)
+    .await?
+    .map(|r| hydration_row(&r))
+    .transpose()
 }
 
 /// Enregistre les réglages ; l'horloge des rappels repart de maintenant.
 pub async fn put_hydration(db: &Db, user: i64, settings: &str, enabled: bool) -> Result<()> {
     sqlx::query(
-        "INSERT INTO hydration (user_id, settings, enabled, last_reminder) VALUES ($1, $2, $3, now())
-         ON CONFLICT (user_id) DO UPDATE SET settings = $2, enabled = $3, last_reminder = now()",
+        "INSERT INTO hydration (user_id, settings, enabled, last_reminder, configured)
+         VALUES ($1, $2, $3, now(), true)
+         ON CONFLICT (user_id) DO UPDATE SET settings = $2, enabled = $3, last_reminder = now(), configured = true",
     )
     .bind(user)
     .bind(settings)
@@ -697,12 +840,14 @@ pub async fn put_hydration(db: &Db, user: i64, settings: &str, enabled: bool) ->
 }
 
 pub async fn hydration_enabled(db: &Db) -> Result<Vec<HydrationRow>> {
-    sqlx::query("SELECT user_id, settings, last_reminder, last_drink FROM hydration WHERE enabled")
-        .fetch_all(&db.pool)
-        .await?
-        .iter()
-        .map(hydration_row)
-        .collect()
+    sqlx::query(
+        "SELECT user_id, settings, last_reminder, last_drink, configured FROM hydration WHERE enabled",
+    )
+    .fetch_all(&db.pool)
+    .await?
+    .iter()
+    .map(hydration_row)
+    .collect()
 }
 
 /// Réserve un rappel : réussit seulement si personne ne l'a envoyé entre-temps.
@@ -725,36 +870,87 @@ pub async fn claim_reminder(
         == 1)
 }
 
-/// Ajoute un verre si la limite du jour (depuis `since`) n'est pas atteinte,
-/// en une seule instruction. `defaults` : réglages si le compte n'en a pas.
+/// Ajoute une prise si la limite de son jour (qui commence à `day`) n'est
+/// pas atteinte et si son identifiant est nouveau, en une seule
+/// instruction. `defaults` : réglages si le compte n'en a pas.
 pub async fn add_drink(
     db: &Db,
     user: i64,
     device: &str,
-    since: DateTime<Utc>,
+    drink: &crate::protocol::Drink,
+    day: DateTime<Utc>,
     max: u32,
     defaults: &str,
 ) -> Result<bool> {
     let row = sqlx::query(
         "WITH ins AS (
-             INSERT INTO hydration_log (user_id, device_id)
-             SELECT $1, $2
-             WHERE (SELECT count(*) FROM hydration_log WHERE user_id = $1 AND at >= $3) < $4
+             INSERT INTO hydration_log (user_id, device_id, client_id, at, ml)
+             SELECT $1, $2, $3, $4, $5
+             WHERE (SELECT count(*) FROM hydration_log
+                    WHERE user_id = $1 AND at >= $6 AND at < $6 + interval '1 day') < $7
+             ON CONFLICT (user_id, client_id) DO NOTHING
              RETURNING at
          )
          INSERT INTO hydration (user_id, settings, last_drink)
-         SELECT $1, $5, at FROM ins
-         ON CONFLICT (user_id) DO UPDATE SET last_drink = EXCLUDED.last_drink
+         SELECT $1, $8, at FROM ins
+         ON CONFLICT (user_id) DO UPDATE
+             SET last_drink = GREATEST(hydration.last_drink, EXCLUDED.last_drink)
          RETURNING user_id",
     )
     .bind(user)
     .bind(device)
-    .bind(since)
+    .bind(&drink.id)
+    .bind(drink.at)
+    .bind(drink.ml as i32)
+    .bind(day)
     .bind(i64::from(max))
     .bind(defaults)
     .fetch_optional(&db.pool)
     .await?;
     Ok(row.is_some())
+}
+
+async fn refresh_last_drink(db: &Db, user: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE hydration SET last_drink = (SELECT max(at) FROM hydration_log WHERE user_id = $1)
+         WHERE user_id = $1",
+    )
+    .bind(user)
+    .execute(&db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Retire des prises par identifiant ; renvoie le nombre retiré.
+pub async fn remove_drinks(db: &Db, user: i64, ids: &[String]) -> Result<u64> {
+    let n = sqlx::query("DELETE FROM hydration_log WHERE user_id = $1 AND client_id = ANY($2)")
+        .bind(user)
+        .bind(ids)
+        .execute(&db.pool)
+        .await?
+        .rows_affected();
+    if n > 0 {
+        refresh_last_drink(db, user).await?;
+    }
+    Ok(n)
+}
+
+/// Prises depuis `since`, dans l'ordre.
+pub async fn drinks_after(db: &Db, user: i64, since: DateTime<Utc>) -> Result<Vec<crate::protocol::Drink>> {
+    sqlx::query("SELECT client_id, at, ml FROM hydration_log WHERE user_id = $1 AND at >= $2 ORDER BY at, id")
+        .bind(user)
+        .bind(since)
+        .fetch_all(&db.pool)
+        .await?
+        .iter()
+        .map(|r| {
+            Ok(crate::protocol::Drink {
+                id: r.try_get("client_id")?,
+                at: r.try_get("at")?,
+                ml: u32::try_from(r.try_get::<i32, _>("ml")?).unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 /// Retire le dernier verre depuis `since`.
@@ -768,24 +964,25 @@ pub async fn undo_drink(db: &Db, user: i64, since: DateTime<Utc>) -> Result<()> 
     .bind(since)
     .execute(&db.pool)
     .await?;
-    sqlx::query(
-        "UPDATE hydration SET last_drink = (SELECT max(at) FROM hydration_log WHERE user_id = $1)
-         WHERE user_id = $1",
-    )
-    .bind(user)
-    .execute(&db.pool)
-    .await?;
-    Ok(())
+    refresh_last_drink(db, user).await
 }
 
-pub async fn drinks_since(db: &Db, user: i64, since: DateTime<Utc>) -> Result<u32> {
-    let n: i64 = sqlx::query("SELECT count(*) AS n FROM hydration_log WHERE user_id = $1 AND at >= $2")
-        .bind(user)
-        .bind(since)
-        .fetch_one(&db.pool)
-        .await?
-        .try_get("n")?;
-    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+/// Nombre de prises et quantité (ml) depuis `since`.
+pub async fn drinks_since(db: &Db, user: i64, since: DateTime<Utc>) -> Result<(u32, u32)> {
+    let r = sqlx::query(
+        "SELECT count(*) AS n, COALESCE(sum(ml), 0)::BIGINT AS ml
+         FROM hydration_log WHERE user_id = $1 AND at >= $2",
+    )
+    .bind(user)
+    .bind(since)
+    .fetch_one(&db.pool)
+    .await?;
+    let n: i64 = r.try_get("n")?;
+    let ml: i64 = r.try_get("ml")?;
+    Ok((
+        u32::try_from(n).unwrap_or(u32::MAX),
+        u32::try_from(ml).unwrap_or(u32::MAX),
+    ))
 }
 
 /// Supprime l'historique plus ancien que `days` jours.

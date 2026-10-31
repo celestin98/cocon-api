@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
+use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
@@ -59,7 +59,9 @@ impl Mailer {
             .context("COCON_SMTP_PASSWORD manquant (variable d'environnement ou fichier .env)")?;
         let user = env("COCON_SMTP_USER").unwrap_or_else(|| from.email.to_string());
         let port: u16 = match env("COCON_SMTP_PORT") {
-            Some(p) => p.parse().with_context(|| format!("COCON_SMTP_PORT invalide : {p}"))?,
+            Some(p) => p
+                .parse()
+                .with_context(|| format!("COCON_SMTP_PORT invalide : {p}"))?,
             None => 465,
         };
         let starttls = match env("COCON_SMTP_TLS").as_deref() {
@@ -111,22 +113,31 @@ impl Mailer {
     }
 
     async fn send(&self, to: &str, subject: &str, text: String) -> Result<()> {
-        let to: Mailbox = to.parse().with_context(|| format!("adresse e-mail invalide : {to}"))?;
+        let to: Mailbox = to
+            .parse()
+            .with_context(|| format!("adresse e-mail invalide : {to}"))?;
         let message = Message::builder()
             .from(self.from.clone())
-            .to(to)
+            .to(to.clone())
             .subject(subject)
             .header(ContentType::TEXT_PLAIN)
             .body(text.clone())?;
         match &self.transport {
             Transport::Smtp(t) => {
-                t.send(message).await.context("le serveur SMTP a refusé l'envoi")?;
+                t.send(message)
+                    .await
+                    .context("le serveur SMTP a refusé l'envoi")?;
             }
             #[cfg(test)]
             Transport::Memory(outbox) => {
                 let _ = message;
-                let Some(outbox) = outbox else { bail!("envoi en échec (test)") };
-                outbox.lock().unwrap().push((to.email.to_string(), subject.to_owned(), text));
+                let Some(outbox) = outbox else {
+                    bail!("envoi en échec (test)")
+                };
+                outbox
+                    .lock()
+                    .unwrap()
+                    .push((to.email.to_string(), subject.to_owned(), text));
             }
         }
         Ok(())
@@ -134,13 +145,18 @@ impl Mailer {
 
     /// Envoie le code de vérification de l'adresse (inscription).
     pub async fn send_signup_code(&self, to: &str, code: &str) -> Result<()> {
-        self.send(to, &format!("Votre code Cocon : {code}"), signup_code_text(code)).await
+        self.send(to, &format!("Votre code Cocon : {code}"), signup_code_text(code))
+            .await
     }
 
     /// Envoie un code d'invitation.
     pub async fn send_invite(&self, to: &str, code: &str, days: u32) -> Result<()> {
-        self.send(to, "Votre invitation à Cocon", invite_text(self.public_url.as_deref(), code, days))
-            .await
+        self.send(
+            to,
+            "Votre invitation à Cocon",
+            invite_text(self.public_url.as_deref(), code, days),
+        )
+        .await
     }
 }
 

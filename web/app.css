@@ -708,6 +708,20 @@ section.bloc,
 .formulaire-pied .bouton.lien:hover,
 .champ-erreur .bouton.lien:hover { color: var(--bleu-fonce); }
 
+.formulaire-pied .bouton.lien:disabled {
+  color: inherit;
+  font-weight: 400;
+  text-decoration: none;
+}
+
+/* Code à 6 chiffres reçu par e-mail. */
+.code-saisie {
+  font-size: 1.5rem;
+  letter-spacing: 0.35em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 /* Onglets Connexion / Inscription. */
 .bascule {
   display: grid;

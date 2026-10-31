@@ -83,20 +83,29 @@ Inscriptions (`COCON_API_SIGNUP` dans `.env`, ou `--signup`) :
 
 | Mode | Effet |
 |---|---|
-| `open` (par défaut) | tout le monde peut créer un compte ; chaque compte ne voit que ses propres PC |
+| `open` (par défaut) | tout le monde peut créer un compte ; l'adresse est confirmée par un code à 6 chiffres envoyé par e-mail (SMTP obligatoire, voir ci-dessous) ; chaque compte ne voit que ses propres PC |
 | `invite` | un code est demandé : `cocon-api invite --days 7` en crée un, à usage unique |
 | `closed` | inscriptions fermées ; comptes créés en ligne de commande |
 
 Pour un serveur personnel, `invite` ou `closed` une fois votre compte créé.
 
-Pour envoyer les invitations par e-mail (`cocon-api invite --email ami@exemple.org`),
-renseignez dans `.env` le SMTP de la boîte expéditrice (Hostinger par défaut) :
+**Envoi d'e-mails (SMTP).** En mode `open`, l'inscription se fait en deux
+étapes : e-mail et mot de passe, puis le code à 6 chiffres reçu par e-mail
+(valable 10 minutes, 5 essais, renvoi possible après une minute, 5 envois au
+plus). Sans confirmation, le compte ne peut pas se connecter et il est supprimé
+au bout de 24 h. Le serveur refuse de démarrer en mode `open` si le SMTP n'est
+pas configuré. Le même SMTP sert à `cocon-api invite --email ami@exemple.org`.
+
+Renseignez dans `.env` le SMTP de la boîte expéditrice (Hostinger par défaut) :
 `COCON_SMTP_PASSWORD` (mot de passe de `contact@tkcb.pro`) et, si besoin,
 `COCON_SMTP_HOST` (par défaut `smtp.hostinger.com`),
 `COCON_SMTP_PORT` (465 en TLS direct, par défaut, ou 587 en STARTTLS),
-`COCON_SMTP_USER` (par défaut l'adresse de l'expéditeur), `COCON_MAIL_FROM` (par défaut `Cocon <contact@tkcb.pro>`) et, au besoin,
-`COCON_PUBLIC_URL` (adresse de l'interface, citée dans le message). La connexion
-est toujours chiffrée. Si l'envoi échoue, le code est affiché pour ne pas être perdu.
+`COCON_SMTP_USER` (par défaut l'adresse de l'expéditeur), `COCON_MAIL_FROM`
+(par défaut `Cocon <contact@tkcb.pro>`) et, au besoin, `COCON_PUBLIC_URL`
+(adresse de l'interface, citée dans les invitations). La connexion est toujours
+chiffrée. Si l'envoi d'une invitation échoue, le code est affiché pour ne pas
+être perdu ; si l'envoi d'un code d'inscription échoue, le compte en attente est
+supprimé et la personne est invitée à réessayer.
 
 ### 4. Service et HTTPS
 
@@ -193,8 +202,9 @@ Ouvrez l'adresse du serveur dans un navigateur.
   objectifs, mis à jour en direct. Démarrez une session, ou arrêtez-la en
   respectant la friction choisie (phrase à taper, ou bouton à maintenir).
 - **Tâches** : ajoutez, cochez, étoilez celles de la prochaine session.
-- **Hydratation** : verres bus aujourd'hui, bouton « J'ai bu un verre », et
-  réglages des rappels (fréquence, plage horaire, objectif du jour). Le
+- **Hydratation** : quantité bue aujourd'hui (y compris sur les PC reliés),
+  un verre ou 500 ml en un clic, et réglages (objectif en ml, contenance du
+  verre, fréquence et plage horaire des rappels). Le
   rappel s'affiche en bandeau, et en notification du navigateur si vous
   l'autorisez.
 - **Réglages** : durée, rythme Pomodoro, friction, sites bloqués,
@@ -281,19 +291,24 @@ suivante ; un objectif atteint coche la tâche.
 C'est le serveur qui décide quand rappeler de boire, et qui prévient tous
 les appareils du compte : notification sur chaque PC relié (avec un bouton
 « J'ai bu un verre »), bandeau dans l'interface web, événement pour
-l'application mobile. Un rappel tombe `interval_minutes` après le dernier
+l'application mobile. Les prises sont comptées en millilitres et portent un
+identifiant : le connecteur du PC y reporte celles notées localement, même
+hors connexion, et recopie celles notées ailleurs. Un rappel tombe `interval_minutes` après le dernier
 rappel ou le dernier verre, uniquement dans la plage horaire choisie (heure
 du fuseau `timezone`) ; il n'est jamais envoyé deux fois.
 
 | Route | Corps | Réponse |
 |---|---|---|
-| `GET /v1/hydration` | — | `{settings, today, last_drink, next_reminder}` |
-| `PUT /v1/hydration` | `{enabled, interval_minutes (15–240), start: "HH:MM", end: "HH:MM", goal (1–30), timezone: "Europe/Paris"}` | état ; l'horloge des rappels repart de maintenant |
-| `POST /v1/hydration/drink` | — | état (un verre de plus ; 60 par jour au plus) |
-| `DELETE /v1/hydration/drink` | — | état (annule le dernier verre du jour) |
+| `GET /v1/hydration` | — | `{settings, today, today_ml, last_drink, next_reminder, configured}` |
+| `PUT /v1/hydration` | `{enabled, interval_minutes (15–240), start: "HH:MM", end: "HH:MM", goal_ml (250–6000), glass_ml (50–1000), timezone: "Europe/Paris"}` | état ; l'horloge des rappels repart de maintenant |
+| `POST /v1/hydration/drink` | facultatif : `{ml (1–2000)}`, un verre sinon | état (60 prises par jour au plus) |
+| `DELETE /v1/hydration/drink` | — | état (annule la dernière prise du jour) |
+
+L'ancien champ `goal` (en verres) est encore accepté et converti en
+`goal_ml` ; les réglages déjà enregistrés le sont à la lecture.
 
 Une plage dont la fin précède le début traverse minuit (`22:00`–`02:00`).
-L'historique des verres est conservé 90 jours.
+L'historique des prises est conservé 90 jours.
 
 ### Temps réel
 
@@ -305,8 +320,8 @@ l'état de chaque PC, puis à chaque changement :
 {"type": "config_changed", "version": 4}
 {"type": "tasks_changed", "version": 9}
 {"type": "devices_changed"}
-{"type": "hydration_reminder", "today": 3, "goal": 8}
-{"type": "hydration_changed", "settings": {…}, "today": 4, "last_drink": "…", "next_reminder": "…"}
+{"type": "hydration_reminder", "today": 3, "goal": 8, "today_ml": 750, "goal_ml": 2000}
+{"type": "hydration_changed", "settings": {…}, "today": 4, "today_ml": 1000, "last_drink": "…", "next_reminder": "…", "configured": true}
 ```
 
 `/v1/agent` est réservé au connecteur des PC.

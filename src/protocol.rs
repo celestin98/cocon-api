@@ -104,6 +104,26 @@ pub struct SignupRequest {
     pub invite: Option<String>,
 }
 
+/// Inscription libre : compte créé, adresse à confirmer par le code reçu.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignupPending {
+    pub email: String,
+    pub verify: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyEmailRequest {
+    pub email: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResendCodeRequest {
+    pub email: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebLogin {
@@ -291,8 +311,38 @@ pub enum AgentMessage {
         base_version: u64,
         tasks: Vec<Task>,
     },
-    /// « J'ai bu » depuis la notification du PC.
+    /// « J'ai bu » depuis la notification du PC (connecteurs d'avant la
+    /// synchronisation : un verre).
     HydrationDrink,
+    /// Prises notées ou annulées sur le PC, à reporter.
+    HydrationSync {
+        #[serde(default)]
+        entries: Vec<Drink>,
+        #[serde(default)]
+        removed: Vec<String>,
+    },
+    /// Réglages d'hydratation modifiés sur le PC.
+    HydrationSettings(AgentHydrationSettings),
+}
+
+/// Une prise d'eau, identifiée par l'appareil qui l'a notée.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drink {
+    pub id: String,
+    pub at: DateTime<Utc>,
+    pub ml: u32,
+}
+
+/// Réglages que le PC sait modifier (la plage horaire se règle sur le web).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentHydrationSettings {
+    pub enabled: bool,
+    pub interval_minutes: u32,
+    pub goal_ml: u32,
+    pub glass_ml: u32,
+    /// Fuseau du PC, retenu seulement si le compte n'a encore rien réglé.
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,13 +355,23 @@ pub enum ServerMessage {
     TasksAccepted {
         version: u64,
     },
-    /// Rappel d'hydratation à afficher.
+    /// Rappel d'hydratation à afficher (`today`, `goal` : en verres).
     HydrationReminder {
         today: u32,
         goal: u32,
+        today_ml: u32,
+        goal_ml: u32,
     },
     /// Verre enregistré (ici ou ailleurs) : retirer le rappel affiché.
     HydrationAcknowledged,
+    /// Réglages et prises des derniers jours (depuis `since`) : le PC
+    /// aligne son journal local.
+    HydrationSync {
+        since: DateTime<Utc>,
+        entries: Vec<Drink>,
+        settings: crate::hydration::HydrationSettings,
+        configured: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +389,8 @@ pub enum ClientEvent {
     HydrationReminder {
         today: u32,
         goal: u32,
+        today_ml: u32,
+        goal_ml: u32,
     },
     /// Réglages ou compteur d'hydratation modifiés.
     HydrationChanged(Box<crate::hydration::HydrationState>),

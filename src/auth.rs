@@ -36,6 +36,8 @@ pub const MIN_PASSWORD_LEN: usize = 12;
 pub const EMAIL_CODE_TTL: chrono::Duration = chrono::Duration::minutes(10);
 pub const EMAIL_CODE_MAX_ATTEMPTS: i32 = 5;
 pub const EMAIL_CODE_RESEND_AFTER: chrono::Duration = chrono::Duration::seconds(60);
+/// Codes envoyés au plus par compte en attente (5 × 5 essais en tout).
+pub const EMAIL_CODE_MAX_SENDS: i32 = 5;
 /// Un compte jamais confirmé est supprimé après ce délai.
 pub const UNVERIFIED_TTL: chrono::Duration = chrono::Duration::hours(24);
 
@@ -139,7 +141,10 @@ pub fn email_code_hash(user: i64, code: &str) -> String {
 
 /// Normalise une saisie de code : chiffres seuls (« 482 913 » → « 482913 »).
 pub fn clean_email_code(input: &str) -> Option<String> {
-    let digits: String = input.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+    let digits: String = input
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
     (digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
 }
 

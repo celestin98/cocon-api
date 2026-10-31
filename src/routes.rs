@@ -36,7 +36,13 @@ pub struct AppState {
     pub refresh_limiter: Arc<RateLimiter>,
     /// Inscriptions : 5 par IP et par heure.
     pub signup_limiter: Arc<RateLimiter>,
+    /// Codes reçus par e-mail (saisie, renvoi) : 20 par IP et par 10 minutes.
+    pub code_limiter: Arc<RateLimiter>,
     pub signup: SignupMode,
+    /// Envoi des codes de vérification d'adresse. En inscription libre, le
+    /// serveur refuse de démarrer sans (voir `serve`) ; absent, le compte
+    /// est ouvert sans vérification (tests uniquement).
+    pub mailer: Option<Arc<crate::mail::Mailer>>,
     /// Proxy sur un réseau privé : voir [`ClientIp`].
     pub behind_proxy: bool,
 }
@@ -49,7 +55,9 @@ impl AppState {
             login_limiter: Arc::new(RateLimiter::new(10, Duration::from_secs(600))),
             refresh_limiter: Arc::new(RateLimiter::new(120, Duration::from_secs(600))),
             signup_limiter: Arc::new(RateLimiter::new(5, Duration::from_secs(3600))),
+            code_limiter: Arc::new(RateLimiter::new(20, Duration::from_secs(600))),
             signup: SignupMode::Open,
+            mailer: None,
             behind_proxy: false,
         }
     }
@@ -79,6 +87,10 @@ impl Error {
             "unauthorized",
             "Authentification requise",
         )
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -375,6 +387,15 @@ pub async fn check_credentials(
             "mot de passe".into(),
         );
         return Err(invalid());
+    }
+    // Après le mot de passe seulement : ne dit rien à qui ne le connaît pas.
+    if !user.email_verified {
+        audit(state, Some(user.id), None, ip, "login_unverified", String::new());
+        return Err(Error::new(
+            StatusCode::FORBIDDEN,
+            "email_unverified",
+            "Adresse e-mail pas encore confirmée : saisissez le code reçu par e-mail",
+        ));
     }
     if let Some(secret) = &user.totp_secret {
         let Some(code) = totp.filter(|c| !c.trim().is_empty()) else {

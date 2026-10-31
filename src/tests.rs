@@ -669,7 +669,11 @@ async fn hydration_reminders_are_sent_once_and_acknowledged_everywhere() {
     assert_eq!(crate::hydration::tick(&state, later).await.unwrap(), 1);
     assert_eq!(crate::hydration::tick(&state, later).await.unwrap(), 0);
     let r = next_of_type(&mut agent, "hydration_reminder").await;
-    assert_eq!(r, json!({"type": "hydration_reminder", "today": 0, "goal": 8}));
+    // Ancien objectif en verres (8) : converti en 2 L de verres de 250 ml.
+    assert_eq!(
+        r,
+        json!({"type": "hydration_reminder", "today": 0, "goal": 8, "today_ml": 0, "goal_ml": 2000})
+    );
     let r = next_of_type(&mut events, "hydration_reminder").await;
     assert_eq!(r["goal"], 8);
 
@@ -722,6 +726,150 @@ async fn hydration_reminders_are_sent_once_and_acknowledged_everywhere() {
     assert_eq!((s, v["next_reminder"].is_null()), (StatusCode::OK, true));
     let much_later = now + chrono::Duration::hours(2);
     assert_eq!(crate::hydration::tick(&state, much_later).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn hydration_syncs_with_the_pc_journal() {
+    let Some(db) = Db::test().await else {
+        eprintln!("TEST_DATABASE_URL absent : test ignoré");
+        return;
+    };
+    let hash = auth::hash_password(PASSWORD).unwrap();
+    db::create_user(&db, EMAIL, &hash).await.unwrap();
+    let state = routes::AppState::new(db.clone());
+    let app = routes::router(state.clone());
+    let addr = spawn_server(app.clone()).await;
+    let pc = login(&app, "desktop").await;
+    let phone = login(&app, "mobile").await;
+    let (pct, pt) = (tok(&pc, "access_token"), tok(&phone, "access_token"));
+    let mut agent = ws_connect(addr, "/v1/agent", &pct).await.unwrap();
+    let send = |v: Value| tungstenite::Message::Text(v.to_string().into());
+
+    // Rien encore : le PC reçoit l'état (vide, réglages par défaut).
+    agent.send(send(json!({"type": "hydration_sync"}))).await.unwrap();
+    let snap = next_of_type(&mut agent, "hydration_sync").await;
+    assert_eq!(snap["entries"], json!([]));
+    assert_eq!(snap["configured"], false);
+
+    // Premier PC relié : ses réglages remplacent les valeurs par défaut,
+    // fuseau compris.
+    agent
+        .send(send(json!({
+            "type": "hydration_settings", "enabled": true, "interval_minutes": 30,
+            "goal_ml": 2500, "glass_ml": 330, "timezone": "Europe/Paris",
+        })))
+        .await
+        .unwrap();
+    let snap = next_of_type(&mut agent, "hydration_sync").await;
+    assert_eq!(snap["configured"], true);
+    assert_eq!(
+        (&snap["settings"]["goal_ml"], &snap["settings"]["timezone"]),
+        (&json!(2500), &json!("Europe/Paris"))
+    );
+
+    // Prises notées hors ligne sur le PC : reportées une seule fois.
+    let now = chrono::Utc::now();
+    let at = |min: i64| (now - chrono::Duration::minutes(min)).to_rfc3339();
+    let entries = json!([
+        {"id": "pc-1", "at": at(90), "ml": 330},
+        {"id": "pc-2", "at": at(60), "ml": 500},
+        // Ignorées : identifiant douteux, trop ancienne, quantité absurde.
+        {"id": "../x", "at": at(30), "ml": 250},
+        {"id": "pc-old", "at": (now - chrono::Duration::days(30)).to_rfc3339(), "ml": 250},
+        {"id": "pc-big", "at": at(20), "ml": 9000},
+    ]);
+    for _ in 0..2 {
+        agent
+            .send(send(json!({"type": "hydration_sync", "entries": entries})))
+            .await
+            .unwrap();
+    }
+    let snap = loop {
+        let v = next_of_type(&mut agent, "hydration_sync").await;
+        if v["entries"].as_array().unwrap().len() == 2 {
+            break v;
+        }
+    };
+    let ids: Vec<&str> = snap["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["pc-1", "pc-2"]);
+    let (_, v) = call(&app, "GET", "/v1/hydration", Some(&pt), None).await;
+    assert_eq!(
+        (v["today"].as_u64(), v["today_ml"].as_u64()),
+        (Some(2), Some(830))
+    );
+    assert_eq!(v["settings"]["glass_ml"], 330);
+
+    // Un verre bu ailleurs (quantité libre) : envoyé au PC avec son identifiant.
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/v1/hydration/drink",
+        Some(&pt),
+        Some(json!({"ml": 200})),
+    )
+    .await;
+    assert_eq!((s, v["today_ml"].as_u64()), (StatusCode::OK, Some(1030)));
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/v1/hydration/drink",
+        Some(&pt),
+        Some(json!({"ml": 0})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let snap = loop {
+        let v = next_of_type(&mut agent, "hydration_sync").await;
+        if v["entries"].as_array().unwrap().len() == 3 {
+            break v;
+        }
+    };
+    assert_eq!(snap["entries"][2]["ml"], 200);
+
+    // Annulé sur le PC : retiré du serveur.
+    agent
+        .send(send(json!({"type": "hydration_sync", "removed": ["pc-2"]})))
+        .await
+        .unwrap();
+    loop {
+        let v = next_of_type(&mut agent, "hydration_sync").await;
+        if v["entries"].as_array().unwrap().len() == 2 {
+            break;
+        }
+    }
+    let (_, v) = call(&app, "GET", "/v1/hydration", Some(&pt), None).await;
+    assert_eq!(v["today_ml"].as_u64(), Some(530));
+
+    // Réglages déjà choisis : la plage et le fuseau restent ceux du
+    // serveur, l'objectif suit le PC ; un réglage hors bornes est refusé.
+    agent
+        .send(send(json!({
+            "type": "hydration_settings", "enabled": true, "interval_minutes": 30,
+            "goal_ml": 3000, "glass_ml": 330, "timezone": "America/Montreal",
+        })))
+        .await
+        .unwrap();
+    let snap = loop {
+        let v = next_of_type(&mut agent, "hydration_sync").await;
+        if v["settings"]["goal_ml"] == 3000 {
+            break v;
+        }
+    };
+    assert_eq!(snap["settings"]["timezone"], "Europe/Paris");
+    agent
+        .send(send(json!({
+            "type": "hydration_settings", "enabled": true, "interval_minutes": 1,
+            "goal_ml": 3000, "glass_ml": 330,
+        })))
+        .await
+        .unwrap();
+    let snap = next_of_type(&mut agent, "hydration_sync").await;
+    assert_eq!(snap["settings"]["interval_minutes"], 30);
 }
 
 // ------------------------------------------------------------ interface web
@@ -1306,5 +1454,353 @@ async fn forwarded_for_trusted_only_from_proxy_network() {
     assert_eq!(
         attempt(&app, "172.18.0.5", "198.51.100.99").await,
         StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+// ------------------------------------------------------------ inscription libre vérifiée par e-mail
+
+/// Serveur en inscription libre avec boîte d'envoi en mémoire.
+async fn open_signup() -> Option<(Router, Db, crate::mail::Outbox)> {
+    let db = Db::test().await?;
+    let (mailer, outbox) = crate::mail::Mailer::memory();
+    let mut st = routes::AppState::new(db.clone());
+    st.mailer = Some(std::sync::Arc::new(mailer));
+    Some((routes::router(st), db, outbox))
+}
+
+/// Dernier code à 6 chiffres envoyé à `to`.
+fn last_code(outbox: &crate::mail::Outbox, to: &str) -> String {
+    let sent = outbox.lock().unwrap();
+    let (_, subject, text) = sent
+        .iter()
+        .rev()
+        .find(|(dest, ..)| dest == to)
+        .expect("aucun e-mail");
+    let code = subject.rsplit(' ').next().unwrap().to_owned();
+    assert!(
+        code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()),
+        "{subject}"
+    );
+    assert!(text.contains(&code));
+    code
+}
+
+async fn verify(app: &Router, email: &str, code: &str) -> WebResp {
+    web(
+        app,
+        "POST",
+        "/web/signup/verify",
+        None,
+        Some(json!({"email": email, "code": code})),
+        Some(ORIGIN),
+        false,
+    )
+    .await
+}
+
+fn other_code(code: &str) -> String {
+    format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000)
+}
+
+#[tokio::test]
+async fn open_signup_requires_the_emailed_code() {
+    let Some((app, _, outbox)) = open_signup().await else {
+        eprintln!("TEST_DATABASE_URL absent : test ignoré");
+        return;
+    };
+    const NEW: &str = "neuf@exemple.org";
+    let password = "une phrase de passe solide";
+
+    // Étape 1 : compte en attente, pas de session, un code par e-mail.
+    let r = web(
+        &app,
+        "POST",
+        "/web/signup",
+        None,
+        Some(signup_body("Neuf@Exemple.org")),
+        Some(ORIGIN),
+        false,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.json);
+    assert_eq!(
+        (r.json["email"].as_str(), r.json["verify"].as_bool()),
+        (Some(NEW), Some(true))
+    );
+    assert!(r.cookie.is_none(), "pas de session avant confirmation");
+    let code = last_code(&outbox, NEW);
+
+    // Connexion impossible avant confirmation (le mot de passe est bon).
+    let login = json!({"email": NEW, "password": password});
+    let l = web(
+        &app,
+        "POST",
+        "/web/login",
+        None,
+        Some(login.clone()),
+        Some(ORIGIN),
+        false,
+    )
+    .await;
+    assert_eq!(
+        (l.status, l.json["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("email_unverified")),
+        "{}",
+        l.json
+    );
+    assert!(l.cookie.is_none());
+    // Mauvais mot de passe : rien ne trahit le compte en attente.
+    let bad = json!({"email": NEW, "password": "pas le bon mot de passe"});
+    let l = web(&app, "POST", "/web/login", None, Some(bad), Some(ORIGIN), false).await;
+    assert_eq!(l.json["error"], "invalid_credentials");
+
+    // Même adresse : déjà prise, même en attente.
+    let again = web(
+        &app,
+        "POST",
+        "/web/signup",
+        None,
+        Some(signup_body(NEW)),
+        Some(ORIGIN),
+        false,
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
+
+    // Sans Origin : refusé. Format invalide, mauvais code : refusés.
+    let r = web(
+        &app,
+        "POST",
+        "/web/signup/verify",
+        None,
+        Some(json!({"email": NEW, "code": code})),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(verify(&app, NEW, "12ab").await.json["error"], "invalid_code");
+    let r = verify(&app, NEW, &other_code(&code)).await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_code"))
+    );
+
+    // Étape 2 : bon code (espaces tolérés) → session ouverte.
+    let spaced = format!("{} {}", &code[..3], &code[3..]);
+    let r = verify(&app, "NEUF@exemple.org", &spaced).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.json);
+    assert_eq!(r.json["email"], NEW);
+    let cookie = r.cookie.expect("cookie de session");
+    let me = web(&app, "GET", "/v1/me", Some(&cookie), None, None, false).await;
+    assert_eq!(me.status, StatusCode::OK);
+
+    // Le code ne resert pas ; la connexion normale marche.
+    assert_eq!(verify(&app, NEW, &code).await.json["error"], "code_expired");
+    let l = web(&app, "POST", "/web/login", None, Some(login), Some(ORIGIN), false).await;
+    assert_eq!(l.status, StatusCode::OK, "{}", l.json);
+}
+
+#[tokio::test]
+async fn email_code_attempts_resend_and_expiry() {
+    let Some((app, db, outbox)) = open_signup().await else {
+        return;
+    };
+    const NEW: &str = "essais@exemple.org";
+    let r = web(
+        &app,
+        "POST",
+        "/web/signup",
+        None,
+        Some(signup_body(NEW)),
+        Some(ORIGIN),
+        false,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED);
+    let first = last_code(&outbox, NEW);
+
+    // Renvoi trop tôt : pas de nouveau mail (réponse identique, 204).
+    let resend = || {
+        web(
+            &app,
+            "POST",
+            "/web/signup/resend",
+            None,
+            Some(json!({"email": NEW})),
+            Some(ORIGIN),
+            false,
+        )
+    };
+    assert_eq!(resend().await.status, StatusCode::NO_CONTENT);
+    assert_eq!(outbox.lock().unwrap().len(), 1);
+    // Adresse inconnue : même réponse, aucun mail.
+    let r = web(
+        &app,
+        "POST",
+        "/web/signup/resend",
+        None,
+        Some(json!({"email": "inconnu@exemple.org"})),
+        Some(ORIGIN),
+        false,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(outbox.lock().unwrap().len(), 1);
+
+    // 5 erreurs : le code est grillé, même le bon est refusé.
+    for _ in 0..crate::auth::EMAIL_CODE_MAX_ATTEMPTS {
+        assert_eq!(
+            verify(&app, NEW, &other_code(&first)).await.json["error"],
+            "invalid_code"
+        );
+    }
+    assert_eq!(verify(&app, NEW, &first).await.json["error"], "code_expired");
+
+    // Une minute plus tard : nouveau code, qui fonctionne.
+    let age = |db: &Db| {
+        let db = db.clone();
+        async move {
+            sqlx::query("UPDATE email_codes SET sent = now() - interval '2 minutes'")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+    };
+    age(&db).await;
+    assert_eq!(resend().await.status, StatusCode::NO_CONTENT);
+    assert_eq!(outbox.lock().unwrap().len(), 2);
+    let second = last_code(&outbox, NEW);
+
+    // Code expiré (10 min) : refusé.
+    sqlx::query("UPDATE email_codes SET expires = now() - interval '1 second'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(verify(&app, NEW, &second).await.json["error"], "code_expired");
+
+    // Connexion avec le bon mot de passe : renvoie un code (dû), qui confirme.
+    age(&db).await;
+    let login = json!({"email": NEW, "password": "une phrase de passe solide"});
+    let l = web(&app, "POST", "/web/login", None, Some(login), Some(ORIGIN), false).await;
+    assert_eq!(l.json["error"], "email_unverified");
+    assert_eq!(outbox.lock().unwrap().len(), 3);
+    let third = last_code(&outbox, NEW);
+    assert_eq!(verify(&app, NEW, &third).await.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn email_code_sends_are_capped() {
+    let Some((app, db, outbox)) = open_signup().await else {
+        return;
+    };
+    const NEW: &str = "plafond@exemple.org";
+    web(
+        &app,
+        "POST",
+        "/web/signup",
+        None,
+        Some(signup_body(NEW)),
+        Some(ORIGIN),
+        false,
+    )
+    .await;
+    for _ in 0..10 {
+        sqlx::query("UPDATE email_codes SET sent = now() - interval '2 minutes'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        web(
+            &app,
+            "POST",
+            "/web/signup/resend",
+            None,
+            Some(json!({"email": NEW})),
+            Some(ORIGIN),
+            false,
+        )
+        .await;
+    }
+    assert_eq!(
+        outbox.lock().unwrap().len(),
+        crate::auth::EMAIL_CODE_MAX_SENDS as usize
+    );
+}
+
+#[tokio::test]
+async fn signup_mail_failure_frees_the_address() {
+    let Some(db) = Db::test().await else {
+        return;
+    };
+    let mut st = routes::AppState::new(db.clone());
+    st.mailer = Some(std::sync::Arc::new(crate::mail::Mailer::failing()));
+    let app = routes::router(st);
+    let r = web(
+        &app,
+        "POST",
+        "/web/signup",
+        None,
+        Some(signup_body("panne@exemple.org")),
+        Some(ORIGIN),
+        false,
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json["error"].as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("mail_failed"))
+    );
+    assert!(r.cookie.is_none());
+    assert!(
+        db::user_by_email(&db, "panne@exemple.org")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn unverified_accounts_are_purged_after_a_day() {
+    let Some((app, db, _)) = open_signup().await else {
+        return;
+    };
+    for email in ["vieux@exemple.org", "recent@exemple.org"] {
+        web(
+            &app,
+            "POST",
+            "/web/signup",
+            None,
+            Some(signup_body(email)),
+            Some(ORIGIN),
+            false,
+        )
+        .await;
+    }
+    sqlx::query("UPDATE users SET created = now() - interval '25 hours' WHERE email = 'vieux@exemple.org'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Un compte confirmé ancien n'est pas touché.
+    sqlx::query("UPDATE users SET created = now() - interval '25 hours' WHERE email = $1")
+        .bind(EMAIL)
+        .execute(&db.pool)
+        .await
+        .ok();
+    assert_eq!(
+        db::purge_unverified(&db, crate::auth::UNVERIFIED_TTL)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        db::user_by_email(&db, "vieux@exemple.org")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db::user_by_email(&db, "recent@exemple.org")
+            .await
+            .unwrap()
+            .is_some()
     );
 }

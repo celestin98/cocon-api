@@ -13,7 +13,7 @@ const state = {
   config: null, // { version, config }
   tasks: null, // { version, tasks }
   devices: null,
-  hydration: null, // { settings, today, last_drink, next_reminder }
+  hydration: null, // { settings, today, today_ml, last_drink, next_reminder }
   ws: null,
   wsRetry: 1000,
   wsSeen: 0,
@@ -360,18 +360,25 @@ function accueil() {
 
   function afficher(mode) {
     if (mode === "inscription" && !inscriptionOuverte) mode = "connexion";
+    // L'étape de vérification prolonge l'onglet « Inscription ».
+    const onglet = mode === "verification" ? "inscription" : mode;
     for (const [id, b] of Object.entries(tabs)) {
-      const actif = id === mode;
+      const actif = id === onglet;
       b.setAttribute("aria-selected", String(actif));
       b.setAttribute("aria-pressed", String(actif));
       b.tabIndex = actif ? 0 : -1;
     }
-    panneau.setAttribute("aria-labelledby", `onglet-${mode}`);
-    const f = mode === "connexion" ? formConnexion(partage, afficher) : formInscription(partage, afficher, codeInvite);
+    panneau.setAttribute("aria-labelledby", `onglet-${onglet}`);
+    const f =
+      mode === "connexion"
+        ? formConnexion(partage, afficher)
+        : mode === "verification"
+          ? formVerification(partage, afficher)
+          : formInscription(partage, afficher, codeInvite);
     panneau.replaceChildren(f.el);
     queueMicrotask(() => f.focus());
     // L'adresse de la page reflète le formulaire affiché (lien partageable).
-    const hash = mode === "inscription" ? "#/inscription" : "";
+    const hash = onglet === "inscription" ? "#/inscription" : "";
     if (location.hash !== hash) history.replaceState(null, "", location.pathname + location.search + hash);
   }
 
@@ -423,6 +430,10 @@ function formConnexion(partage, afficher) {
           if (err.code === "totp_required") {
             totp.el.hidden = false;
             totp.input.focus();
+          } else if (err.code === "email_unverified") {
+            // Un nouveau code vient d'être envoyé : étape de vérification.
+            partage.email = email.input.value.trim();
+            afficher("verification");
           } else {
             error.textContent = err.message;
           }
@@ -544,11 +555,18 @@ function formInscription(partage, afficher, codeInvite) {
         submit.textContent = "Création du compte…";
         form.setAttribute("aria-busy", "true");
         try {
-          state.me = await api("POST", "/web/signup", {
+          const r = await api("POST", "/web/signup", {
             email: email.input.value.trim(),
             password: pw.value,
             invite: surInvitation ? invite.input.value.trim() : null,
           });
+          if (r?.verify) {
+            // Étape 2 : code à 6 chiffres envoyé par e-mail.
+            partage.email = r.email;
+            afficher("verification");
+            return;
+          }
+          state.me = r;
           // Le code d'invitation ne doit pas rester dans l'adresse.
           history.replaceState(null, "", location.pathname);
           allerA("accueil");
@@ -609,6 +627,135 @@ function formInscription(partage, afficher, codeInvite) {
     el: form,
     focus: () => (surInvitation && !invite.input.value ? invite.input : email.input.value ? pw : email.input).focus(),
   };
+}
+
+/// Étape 2 de l'inscription : le code à 6 chiffres reçu par e-mail.
+function formVerification(partage, afficher) {
+  const adresse = partage.email.trim();
+  const error = h("p", { class: "erreur", role: "alert" });
+  const statut = h("p", { class: "champ-aide", "aria-live": "polite" });
+  const code = champ(
+    "Code reçu par e-mail",
+    h("input", {
+      type: "text",
+      inputmode: "numeric",
+      autocomplete: "one-time-code",
+      spellcheck: "false",
+      maxlength: 7,
+      placeholder: "123456",
+      class: "code-saisie",
+    }),
+    { aide: "Les 6 chiffres du message envoyé par contact@tkcb.pro. Pensez à regarder dans les indésirables." },
+  );
+  const submit = h("button", { class: "bouton principal", type: "submit", text: "Valider" });
+
+  // « Renvoyer le code » : disponible une minute après le dernier envoi.
+  const DELAI = 60;
+  let attente = DELAI;
+  const renvoi = h("button", { type: "button", class: "bouton lien" });
+  const majRenvoi = () => {
+    renvoi.disabled = attente > 0;
+    renvoi.textContent = attente > 0 ? `Renvoyer le code (dans ${attente} s)` : "Renvoyer le code";
+  };
+  const minuteur = setInterval(() => {
+    if (!renvoi.isConnected) return clearInterval(minuteur);
+    if (attente > 0) {
+      attente -= 1;
+      majRenvoi();
+    }
+  }, 1000);
+  majRenvoi();
+  renvoi.addEventListener("click", async () => {
+    error.textContent = "";
+    renvoi.disabled = true;
+    try {
+      await api("POST", "/web/signup/resend", { email: adresse });
+      statut.textContent = `Nouveau code envoyé à ${adresse}.`;
+      code.input.value = "";
+      code.erreur(null);
+      code.input.focus();
+      attente = DELAI;
+    } catch (err) {
+      error.textContent =
+        err.status === 429 ? "Trop de tentatives depuis cette connexion. Réessayez dans quelques minutes." : err.message;
+    } finally {
+      majRenvoi();
+    }
+  });
+
+  const chiffres = () => code.input.value.replace(/[\s-]/g, "");
+  let envoiEnCours = false;
+  const valider = async () => {
+    if (envoiEnCours) return;
+    error.textContent = "";
+    if (!/^[0-9]{6}$/.test(chiffres())) {
+      code.erreur("Le code se compose de 6 chiffres.");
+      return code.input.focus();
+    }
+    envoiEnCours = true;
+    submit.disabled = true;
+    submit.textContent = "Vérification…";
+    form.setAttribute("aria-busy", "true");
+    try {
+      state.me = await api("POST", "/web/signup/verify", { email: adresse, code: chiffres() });
+      history.replaceState(null, "", location.pathname);
+      allerA("accueil");
+    } catch (err) {
+      switch (err.code) {
+        case "invalid_code":
+          code.erreur("Code incorrect. Vérifiez les 6 chiffres reçus.");
+          code.input.select();
+          break;
+        case "code_expired":
+          code.erreur("Ce code n'est plus valable. Demandez-en un nouveau ci-dessous.");
+          if (!renvoi.disabled) renvoi.focus();
+          break;
+        default:
+          error.textContent =
+            err.status === 429 ? "Trop de tentatives depuis cette connexion. Réessayez dans quelques minutes." : err.message;
+      }
+    } finally {
+      envoiEnCours = false;
+      submit.disabled = false;
+      submit.textContent = "Valider";
+      form.removeAttribute("aria-busy");
+    }
+  };
+  // Validation automatique dès le 6e chiffre (saisie ou collage).
+  code.input.addEventListener("input", () => {
+    code.erreur(null);
+    error.textContent = "";
+    if (/^[0-9]{6}$/.test(chiffres())) valider();
+  });
+
+  const form = h(
+    "form",
+    {
+      novalidate: true,
+      onsubmit: (e) => {
+        e.preventDefault();
+        valider();
+      },
+    },
+    h(
+      "header",
+      { class: "formulaire-titre" },
+      h("h2", { text: "Confirmez votre adresse" }),
+      h("p", { class: "discret" }, "Nous avons envoyé un code à 6 chiffres à ", h("strong", { text: adresse }), ". Il est valable 10 minutes."),
+    ),
+    code.el,
+    error,
+    submit,
+    h("p", { class: "formulaire-pied discret" }, renvoi),
+    statut,
+    h(
+      "p",
+      { class: "formulaire-pied discret" },
+      "Mauvaise adresse ? ",
+      h("button", { type: "button", class: "bouton lien", onclick: () => afficher("inscription") }, "La modifier"),
+    ),
+  );
+  return { el: form, focus: () => code.input.focus() };
 }
 
 // ------------------------------------------------------------ espace
@@ -745,12 +892,12 @@ function onEvent(ev) {
   } else if (ev.type === "devices_changed" && r === "securite") {
     majAppareils();
   } else if (ev.type === "hydration_reminder") {
-    afficherRappel(ev.today, ev.goal);
+    afficherRappel(ev.today_ml, ev.goal_ml);
   } else if (ev.type === "hydration_changed") {
-    // Verre enregistré ici ou ailleurs (PC, téléphone) : le rappel a eu sa réponse.
-    const avant = state.hydration?.today ?? 0;
+    // Prise notée ici ou ailleurs (PC, téléphone) : le rappel a eu sa réponse.
+    const avant = state.hydration?.today_ml ?? 0;
     state.hydration = ev;
-    if (ev.today > avant) fermerRappel();
+    if (ev.today_ml > avant) fermerRappel();
     majCarteEau();
   }
 }
@@ -1440,17 +1587,21 @@ function demanderMaintien(secs) {
 // ------------------------------------------------------------ hydratation
 //
 // Le serveur décide quand rappeler de boire (réglages, horloge et compteur
-// sont les siens) ; cette page affiche le compteur, le rappel, et envoie
-// « J'ai bu ».
+// sont les siens) ; cette page affiche le compteur, le rappel, et note les
+// prises. Les PC reliés y reportent les leurs (barre de session, fenêtre
+// principale, `cocon water`) : le compteur est le même partout.
 
 let carteEauAffichee = null;
 
-function verres(n) {
-  return `${n} verre${n > 1 ? "s" : ""}`;
+/// « 250 ml », « 1,25 L ».
+function litres(ml) {
+  if (ml < 1000) return `${Math.round(ml)} ml`;
+  return `${(ml / 1000).toLocaleString("fr-FR", { maximumFractionDigits: 2 })} L`;
 }
 
-async function boire(methode = "POST") {
-  state.hydration = await api(methode, "/v1/hydration/drink");
+/// Une prise (`ml` absent : un verre), ou l'annulation de la dernière.
+async function boire(methode = "POST", ml) {
+  state.hydration = await api(methode, "/v1/hydration/drink", ml === undefined ? undefined : { ml });
   majCarteEau();
   return state.hydration;
 }
@@ -1469,8 +1620,12 @@ function goutte(pleine) {
   return g;
 }
 
+/// Bouteille proposée en plus du verre.
+const BOUTEILLE_ML = 500;
+
 function carteEau() {
-  const { settings, today, next_reminder } = state.hydration;
+  const { settings, today, today_ml, next_reminder } = state.hydration;
+  const objectif = settings.goal_ml;
   const erreur = h("p", { class: "erreur", role: "alert" });
   const agir = async (fn) => {
     erreur.textContent = "";
@@ -1485,11 +1640,15 @@ function carteEau() {
     : next_reminder
       ? `Prochain rappel à ${heure(next_reminder)}`
       : "Aucun rappel prévu";
-  const gouttes = h("div", { class: "gouttes", role: "img", "aria-label": `${verres(today)} sur ${settings.goal}` });
-  for (let i = 0; i < settings.goal; i++) gouttes.append(goutte(i < today));
-  if (today > settings.goal) gouttes.append(h("span", { class: "en-plus", text: `+${today - settings.goal}` }));
+  // Une goutte par verre de l'objectif (12 au plus, chacune vaut alors
+  // davantage).
+  const nb = Math.max(1, Math.min(12, Math.ceil(objectif / settings.glass_ml)));
+  const pleines = Math.min(nb, Math.floor((today_ml * nb) / objectif));
+  const gouttes = h("div", { class: "gouttes", role: "img", "aria-label": `${litres(today_ml)} sur ${litres(objectif)}` });
+  for (let i = 0; i < nb; i++) gouttes.append(goutte(i < pleines));
+  if (today_ml > objectif) gouttes.append(h("span", { class: "en-plus", text: `+${litres(today_ml - objectif)}` }));
   const chiffre = h("span", { class: "chiffres" });
-  compter(chiffre, today);
+  compter(chiffre, today_ml, litres);
   return h(
     "article",
     { class: "carte pleine eau" },
@@ -1498,10 +1657,11 @@ function carteEau() {
       h("button", { class: "bouton", type: "button", onclick: reglagesEau }, "Réglages"),
     ),
     h("div", { class: "eau-corps" },
-      h("p", { class: "grand-chiffre" }, chiffre, h("small", { text: `/ ${settings.goal} ${settings.goal > 1 ? "verres" : "verre"}` })),
+      h("p", { class: "grand-chiffre" }, chiffre, h("small", { text: `/ ${litres(objectif)}` })),
       gouttes,
       h("div", { class: "rangee" },
-        h("button", { class: "bouton principal", type: "button", onclick: () => agir(() => boire()) }, "J'ai bu un verre"),
+        h("button", { class: "bouton principal", type: "button", onclick: () => agir(() => boire()) }, `Un verre · ${litres(settings.glass_ml)}`),
+        h("button", { class: "bouton", type: "button", onclick: () => agir(() => boire("POST", BOUTEILLE_ML)) }, `+ ${litres(BOUTEILLE_ML)}`),
         today > 0
           ? h("button", { class: "bouton lien", type: "button", onclick: () => agir(() => boire("DELETE")) }, "Annuler le dernier")
           : null,
@@ -1519,9 +1679,12 @@ function fermerRappel() {
   rappel = null;
 }
 
-function afficherRappel(today, goal) {
+function afficherRappel(today_ml, goal_ml) {
   fermerRappel();
-  const corps = today >= goal ? `Objectif atteint : ${verres(today)} aujourd'hui.` : `${verres(today)} sur ${goal} aujourd'hui.`;
+  const corps =
+    today_ml >= goal_ml
+      ? `Objectif atteint : ${litres(today_ml)} aujourd'hui.`
+      : `${litres(today_ml)} sur ${litres(goal_ml)} aujourd'hui.`;
   const erreur = h("p", { class: "erreur" });
   const bu = h("button", { class: "bouton principal", type: "button" }, "J'ai bu un verre");
   bu.addEventListener("click", async () => {
@@ -1555,8 +1718,8 @@ async function reglagesEau() {
   const r = structuredClone(state.hydration.settings);
   // Le fuseau du navigateur fixe l'heure locale des rappels et le début du jour.
   r.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  const nombre = (label, key, min, max) => {
-    const i = h("input", { type: "number", min, max, value: r[key], required: true });
+  const nombre = (label, key, min, max, step = 1) => {
+    const i = h("input", { type: "number", min, max, step, value: r[key], required: true });
     i.addEventListener("input", () => (r[key] = Number(i.value)));
     return h("label", { class: "champ" }, label, i);
   };
@@ -1595,11 +1758,12 @@ async function reglagesEau() {
       },
     },
       h("h2", { text: "Rappels d'hydratation" }),
-      h("p", { class: "discret", text: `Le serveur vous rappelle de boire sur tous vos appareils : notification sur le PC, bandeau ici. Heure de ${r.timezone}.` }),
+      h("p", { class: "discret", text: `Le serveur vous rappelle de boire sur tous vos appareils : notification sur le PC, bandeau ici. Objectif et verre sont partagés avec vos PC reliés. Heure de ${r.timezone}.` }),
       h("label", { class: "case" }, actif, "Me rappeler de boire"),
       h("div", { class: "grille-champs" },
         nombre("Toutes les (min)", "interval_minutes", 15, 240),
-        nombre("Objectif (verres par jour)", "goal", 1, 30),
+        nombre("Objectif (ml par jour)", "goal_ml", 250, 6000, 50),
+        nombre("Contenance d'un verre (ml)", "glass_ml", 50, 1000, 10),
         heureChamp("À partir de", "start"),
         heureChamp("Jusqu'à", "end"),
       ),

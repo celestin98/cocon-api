@@ -227,7 +227,13 @@ async fn handle_agent_message(
                 out.extend(sync_tasks(state, user, device, base_version, Some(tasks)).await?);
             }
             AgentMessage::HydrationDrink => {
-                crate::hydration::drink(state, user, device).await?;
+                crate::hydration::drink(state, user, device, None).await?;
+            }
+            AgentMessage::HydrationSync { entries, removed } => {
+                out.extend(crate::hydration::sync(state, user, device, entries, removed).await?);
+            }
+            AgentMessage::HydrationSettings(s) => {
+                out.extend(crate::hydration::settings_from_agent(state, user, s).await?);
             }
         }
         Ok::<_, Error>(out)
