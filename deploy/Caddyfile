@@ -1,0 +1,10 @@
+{
+	# cocon-api partage le réseau de Caddy : l'API d'administration
+	# (127.0.0.1:2019) lui serait accessible. Inutile ici, on la coupe.
+	admin off
+}
+
+{$COCON_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8787
+}

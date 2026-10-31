@@ -1,0 +1,44 @@
+[package]
+name = "cocon-api"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Serveur API de Cocon : sessions en temps réel, à héberger soi-même"
+
+[dependencies]
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+axum = { version = "0.8.9", features = ["ws"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tower-http = { version = "0.7.1", features = ["limit", "timeout", "set-header"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "chrono", "derive"] }
+dotenvy = "0.15.7"
+argon2 = "0.6.0"
+rand = "0.10.3"
+sha2 = "0.11.1"
+base64 = "0.23.1"
+totp-rs = { version = "6.0.0", features = ["otpauth", "gen_secret", "qr"] }
+nix = { version = "0.31.3", features = ["term"] }
+chrono-tz = "0.10.4"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.30"
+futures-util = "0.3"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# Le hachage Argon2 est volontairement coûteux : optimisé même en debug.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

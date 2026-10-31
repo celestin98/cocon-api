@@ -1,0 +1,7 @@
+target
+.env
+.env.*
+.idea
+deploy
+*.db
+*.db-*

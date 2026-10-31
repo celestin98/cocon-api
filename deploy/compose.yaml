@@ -1,0 +1,72 @@
+# Cocon sur un serveur : PostgreSQL + cocon-api + Caddy (HTTPS automatique).
+#
+#   cp .env.example .env && chmod 600 .env   # puis renseignez-le
+#   docker compose up -d --build
+#
+# cocon-api partage le réseau de Caddy : il écoute sur 127.0.0.1, n'est
+# jamais exposé directement, et voit Caddy comme un proxy local (adresse
+# réelle des clients via X-Forwarded-For, pour la limitation des essais).
+
+name: cocon
+
+# Journaux bornés (sinon ils grossissent jusqu'à remplir le disque).
+x-logs: &logs
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?à définir dans .env}
+      COCON_DB_PASSWORD: ${COCON_DB_PASSWORD:?à définir dans .env}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./postgres-init.sh:/docker-entrypoint-initdb.d/cocon.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cocon_api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *logs
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      COCON_DOMAIN: ${COCON_DOMAIN:?à définir dans .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logs
+
+  cocon-api:
+    build: ..
+    image: cocon-api
+    restart: unless-stopped
+    network_mode: service:caddy
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://cocon_api:${COCON_DB_PASSWORD}@postgres:5432/cocon_api
+      COCON_API_BIND: 127.0.0.1:8787
+      COCON_API_SIGNUP: ${COCON_API_SIGNUP:-invite}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logs
+
+volumes:
+  postgres:
+  caddy-data:
+  caddy-config:
