@@ -241,15 +241,91 @@ function allerA(page) {
 
 // ------------------------------------------------------------ connexion / inscription
 
+/// Longueur minimale imposée par le serveur (`auth::MIN_PASSWORD_LEN`).
+const MIN_PASSWORD = 12;
+
+let champIds = 0;
+
+/// Champ de formulaire : libellé, saisie, aide et erreur reliées pour les
+/// lecteurs d'écran (`aria-describedby`), erreur affichée sous la saisie.
+function champ(label, input, { aide, suffixe } = {}) {
+  const id = `champ-${++champIds}`;
+  input.id = id;
+  const aideEl = aide ? h("p", { class: "champ-aide", id: `${id}-aide` }, aide) : null;
+  const erreur = h("p", { class: "champ-erreur", id: `${id}-erreur`, "aria-live": "polite" });
+  input.setAttribute("aria-describedby", [aideEl && aideEl.id, erreur.id].filter(Boolean).join(" "));
+  const saisie = suffixe ? h("div", { class: "saisie" }, input, suffixe) : input;
+  const el = h("div", { class: "champ" }, h("label", { for: id, text: label }), saisie, aideEl, erreur);
+  return {
+    el,
+    input,
+    aide: aideEl,
+    erreur(msg) {
+      erreur.textContent = msg ?? "";
+      if (msg) input.setAttribute("aria-invalid", "true");
+      else input.removeAttribute("aria-invalid");
+    },
+  };
+}
+
+/// Bouton « afficher / masquer » d'un mot de passe.
+function oeil(input) {
+  const b = h("button", {
+    type: "button",
+    class: "oeil",
+    "aria-pressed": "false",
+    "aria-label": "Afficher le mot de passe",
+    title: "Afficher le mot de passe",
+  });
+  const icone = () => {
+    const visible = input.type === "text";
+    const g = s("svg", { viewBox: "0 0 24 24", width: 20, height: 20, "aria-hidden": "true", fill: "none", stroke: "currentColor", "stroke-width": 1.8, "stroke-linecap": "round" });
+    g.append(
+      s("path", { d: "M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z" }),
+      s("circle", { cx: 12, cy: 12, r: 3 }),
+    );
+    if (visible) g.append(s("path", { d: "M4 20 20 4" }));
+    b.replaceChildren(g);
+  };
+  b.addEventListener("click", () => {
+    const visible = input.type === "password";
+    input.type = visible ? "text" : "password";
+    const texte = visible ? "Masquer le mot de passe" : "Afficher le mot de passe";
+    b.setAttribute("aria-pressed", String(visible));
+    b.setAttribute("aria-label", texte);
+    b.title = texte;
+    icone();
+    input.focus();
+  });
+  icone();
+  return b;
+}
+
+/// Solidité indicative d'un mot de passe : 0 (insuffisant) à 3 (excellent).
+/// Le serveur n'impose que la longueur ; la longueur reste le critère
+/// principal, la variété ne fait que compléter.
+function solidite(motDePasse, email) {
+  const n = [...motDePasse].length;
+  if (n < MIN_PASSWORD) return { niveau: 0, texte: `Encore ${MIN_PASSWORD - n} caractère${MIN_PASSWORD - n > 1 ? "s" : ""}` };
+  const local = email.split("@")[0].toLowerCase();
+  if (local.length >= 4 && motDePasse.toLowerCase().includes(local)) {
+    return { niveau: 1, texte: "Évitez d'y reprendre votre adresse e-mail" };
+  }
+  if (/^(.)\1+$/.test(motDePasse)) return { niveau: 1, texte: "Évitez de répéter un seul caractère" };
+  const mots = motDePasse.trim().split(/\s+/).length;
+  const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^a-zA-Z0-9]/].filter((r) => r.test(motDePasse)).length;
+  if (n >= 20 || mots >= 4) return { niveau: 3, texte: "Excellent" };
+  if (n >= 16 || classes >= 3) return { niveau: 2, texte: "Bon" };
+  return { niveau: 1, texte: "Correct, un mot de plus le rendrait plus sûr" };
+}
+
 function accueil() {
-  let mode = "login";
   const page = h("div", { class: "accueil" });
 
   const ciel = h("section", { class: "ciel" });
-  const astre = logo(420, "astre");
   ciel.append(
     marque(),
-    astre,
+    logo(420, "astre"),
     h(
       "div",
       {},
@@ -260,93 +336,279 @@ function accueil() {
     ),
   );
 
-  const zone = h("section", { class: "formulaire" });
-  const error = h("p", { class: "erreur", role: "alert" });
-  const email = h("input", { type: "email", autocomplete: "username", required: true, maxlength: 254 });
-  const password = h("input", { type: "password", required: true, maxlength: 1024 });
-  const invite = h("input", { type: "text", autocomplete: "off", maxlength: 200 });
-  const totp = h("input", {
-    type: "text",
-    inputmode: "numeric",
-    autocomplete: "one-time-code",
-    pattern: "[0-9 ]{6,8}",
-    maxlength: 8,
-  });
-  const inviteField = h("label", { class: "champ" }, "Code d'invitation", invite);
-  const totpField = h("label", { class: "champ" }, "Code de double authentification", totp);
-  const hint = h("p", { class: "discret petit" });
-  const submit = h("button", { class: "bouton principal", type: "submit" });
-  const title = h("h2");
+  // Lien d'invitation : https://serveur/?invite=CODE (ouvre l'inscription).
+  const codeInvite = new URLSearchParams(location.search).get("invite")?.trim() ?? "";
+  const inscriptionOuverte = state.info.signup !== "closed";
+  // L'adresse saisie suit d'un formulaire à l'autre.
+  const partage = { email: "" };
 
-  const switchTo = (m) => {
-    mode = m;
-    loginBtn.setAttribute("aria-pressed", String(m === "login"));
-    signupBtn.setAttribute("aria-pressed", String(m === "signup"));
-    title.textContent = m === "login" ? "Se connecter" : "Créer un compte";
-    submit.textContent = m === "login" ? "Se connecter" : "Créer mon compte";
-    password.autocomplete = m === "login" ? "current-password" : "new-password";
-    password.minLength = m === "login" ? 1 : 12;
-    hint.textContent = m === "signup" ? "Au moins 12 caractères. Une phrase de quelques mots est idéale." : "";
-    inviteField.hidden = !(m === "signup" && state.info.signup === "invite");
-    totpField.hidden = true;
-    error.textContent = "";
-  };
-  const loginBtn = h("button", { type: "button", onclick: () => switchTo("login") }, "Connexion");
-  const signupBtn = h("button", { type: "button", onclick: () => switchTo("signup") }, "Inscription");
-  const bascule = h("div", { class: "bascule", role: "group", "aria-label": "Connexion ou inscription" }, loginBtn, signupBtn);
-  if (state.info.signup === "closed") bascule.hidden = true;
+  const zone = h("section", { class: "formulaire" });
+  const onglets = h("div", { class: "bascule", role: "tablist", "aria-label": "Connexion ou inscription" });
+  const panneau = h("div", { class: "formulaire-panneau", role: "tabpanel" });
+  const onglet = (id, label) =>
+    h("button", { type: "button", role: "tab", id: `onglet-${id}`, onclick: () => afficher(id) }, label);
+  const tabs = { connexion: onglet("connexion", "Connexion"), inscription: onglet("inscription", "Inscription") };
+  onglets.append(tabs.connexion, tabs.inscription);
+  onglets.hidden = !inscriptionOuverte;
+  // Flèches gauche / droite entre les onglets (motif ARIA « tabs »).
+  onglets.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    const autre = document.activeElement === tabs.connexion ? "inscription" : "connexion";
+    afficher(autre);
+    tabs[autre].focus();
+  });
+
+  function afficher(mode) {
+    if (mode === "inscription" && !inscriptionOuverte) mode = "connexion";
+    for (const [id, b] of Object.entries(tabs)) {
+      const actif = id === mode;
+      b.setAttribute("aria-selected", String(actif));
+      b.setAttribute("aria-pressed", String(actif));
+      b.tabIndex = actif ? 0 : -1;
+    }
+    panneau.setAttribute("aria-labelledby", `onglet-${mode}`);
+    const f = mode === "connexion" ? formConnexion(partage, afficher) : formInscription(partage, afficher, codeInvite);
+    panneau.replaceChildren(f.el);
+    queueMicrotask(() => f.focus());
+    // L'adresse de la page reflète le formulaire affiché (lien partageable).
+    const hash = mode === "inscription" ? "#/inscription" : "";
+    if (location.hash !== hash) history.replaceState(null, "", location.pathname + location.search + hash);
+  }
+
+  zone.append(h("div", { class: "formulaire-corps" }, onglets, panneau));
+  page.append(ciel, zone);
+  afficher(location.hash === "#/inscription" || codeInvite ? "inscription" : "connexion");
+  return page;
+}
+
+function formConnexion(partage, afficher) {
+  const error = h("p", { class: "erreur", role: "alert" });
+  const email = champ(
+    "Adresse e-mail",
+    h("input", { type: "email", autocomplete: "username", required: true, maxlength: 254, value: partage.email }),
+  );
+  const pw = h("input", { type: "password", autocomplete: "current-password", required: true, maxlength: 1024 });
+  const password = champ("Mot de passe", pw, { suffixe: oeil(pw) });
+  const totp = champ(
+    "Code de double authentification",
+    h("input", { type: "text", inputmode: "numeric", autocomplete: "one-time-code", pattern: "[0-9 ]{6,8}", maxlength: 8 }),
+    { aide: "Les 6 chiffres affichés par votre application d'authentification." },
+  );
+  totp.el.hidden = true;
+  const submit = h("button", { class: "bouton principal", type: "submit", text: "Se connecter" });
+  email.input.addEventListener("input", () => (partage.email = email.input.value));
 
   const form = h(
     "form",
     {
-      novalidate: false,
+      novalidate: true,
       onsubmit: async (e) => {
         e.preventDefault();
         error.textContent = "";
+        if (!email.input.value.trim() || !pw.value) {
+          error.textContent = "Entrez votre adresse e-mail et votre mot de passe.";
+          (email.input.value.trim() ? pw : email.input).focus();
+          return;
+        }
         submit.disabled = true;
+        form.setAttribute("aria-busy", "true");
         try {
-          if (mode === "login") {
-            state.me = await api("POST", "/web/login", {
-              email: email.value,
-              password: password.value,
-              totp: totpField.hidden ? null : totp.value,
-            });
-          } else {
-            state.me = await api("POST", "/web/signup", {
-              email: email.value,
-              password: password.value,
-              invite: inviteField.hidden ? null : invite.value,
-            });
-          }
+          state.me = await api("POST", "/web/login", {
+            email: email.input.value,
+            password: pw.value,
+            totp: totp.el.hidden ? null : totp.input.value,
+          });
           allerA("accueil");
         } catch (err) {
           if (err.code === "totp_required") {
-            totpField.hidden = false;
-            totp.focus();
-            error.textContent = "Entrez le code affiché par votre application d'authentification.";
+            totp.el.hidden = false;
+            totp.input.focus();
           } else {
             error.textContent = err.message;
           }
         } finally {
           submit.disabled = false;
+          form.removeAttribute("aria-busy");
         }
       },
     },
-    bascule,
-    title,
-    h("label", { class: "champ" }, "Adresse e-mail", email),
-    h("label", { class: "champ" }, "Mot de passe", password),
-    hint,
-    inviteField,
-    totpField,
+    h("header", { class: "formulaire-titre" }, h("h2", { text: "Bon retour" }), h("p", { class: "discret", text: "Connectez-vous pour piloter vos sessions." })),
+    email.el,
+    password.el,
+    totp.el,
     error,
     submit,
+    state.info.signup !== "closed"
+      ? h(
+          "p",
+          { class: "formulaire-pied discret" },
+          "Pas encore de compte ? ",
+          h("button", { type: "button", class: "bouton lien", onclick: () => afficher("inscription") }, "Créer un compte"),
+        )
+      : null,
   );
-  zone.append(form);
-  switchTo("login");
-  page.append(ciel, zone);
-  queueMicrotask(() => email.focus());
-  return page;
+  return { el: form, focus: () => (email.input.value ? pw : email.input).focus() };
+}
+
+function formInscription(partage, afficher, codeInvite) {
+  const surInvitation = state.info.signup === "invite";
+  const error = h("p", { class: "erreur", role: "alert" });
+
+  const email = champ(
+    "Adresse e-mail",
+    h("input", { type: "email", autocomplete: "email", required: true, maxlength: 254, value: partage.email }),
+    { aide: "Elle sert à vous connecter. Elle n'est jamais affichée ni partagée." },
+  );
+  const pw = h("input", { type: "password", autocomplete: "new-password", required: true, minlength: MIN_PASSWORD, maxlength: 1024 });
+  const password = champ("Mot de passe", pw, {
+    suffixe: oeil(pw),
+    aide: `Au moins ${MIN_PASSWORD} caractères. Une phrase de quelques mots est idéale.`,
+  });
+  // Jauge de solidité : quatre segments, texte lu par les lecteurs d'écran.
+  const jauge = h("div", { class: "jauge", "aria-hidden": "true" }, h("span"), h("span"), h("span"), h("span"));
+  const verdict = h("span", { class: "jauge-texte" });
+  const indicateur = h("div", { class: "solidite", hidden: true }, jauge, verdict);
+  password.el.insertBefore(indicateur, password.aide);
+
+  const invite = champ(
+    "Code d'invitation",
+    h("input", { type: "text", autocomplete: "off", spellcheck: "false", maxlength: 200, value: codeInvite }),
+    { aide: "Ce serveur est sur invitation : le code vous a été transmis avec le lien." },
+  );
+  invite.el.hidden = !surInvitation;
+
+  const submit = h("button", { class: "bouton principal", type: "submit", text: "Créer mon compte" });
+
+  const majSolidite = () => {
+    const vide = pw.value === "";
+    indicateur.hidden = vide;
+    password.aide.hidden = !vide;
+    if (vide) return;
+    const { niveau, texte } = solidite(pw.value, email.input.value);
+    jauge.dataset.niveau = String(niveau);
+    verdict.textContent = texte;
+  };
+
+  // Vérifications locales (le serveur revalide tout).
+  const verifs = {
+    email: () => {
+      const v = email.input.value.trim();
+      if (!v) return "Entrez votre adresse e-mail.";
+      // Même règle que le serveur (`clean_email`) : domaine avec un point.
+      const [local, domaine] = v.split(/@(?=[^@]*$)/);
+      const ok = v.includes("@") && local && domaine?.includes(".") && !/^\.|\.$/.test(domaine) && !/\s/.test(v);
+      if (!ok) return "Cette adresse ne semble pas valide (exemple : nom@domaine.fr).";
+      return null;
+    },
+    password: () => ([...pw.value].length < MIN_PASSWORD ? `Le mot de passe doit faire au moins ${MIN_PASSWORD} caractères.` : null),
+    invite: () => (surInvitation && !invite.input.value.trim() ? "Entrez votre code d'invitation." : null),
+  };
+  const champs = { email, password, invite };
+  // Une erreur n'apparaît qu'après la première sortie du champ, puis suit la saisie.
+  const touches = new Set();
+  for (const [nom, c] of Object.entries(champs)) {
+    c.input.addEventListener("blur", () => {
+      if (c.input.value === "") return;
+      touches.add(nom);
+      c.erreur(verifs[nom]());
+    });
+    c.input.addEventListener("input", () => {
+      if (touches.has(nom)) c.erreur(verifs[nom]());
+      error.textContent = "";
+    });
+  }
+  email.input.addEventListener("input", () => {
+    partage.email = email.input.value;
+    majSolidite();
+  });
+  pw.addEventListener("input", majSolidite);
+
+  const form = h(
+    "form",
+    {
+      novalidate: true,
+      onsubmit: async (e) => {
+        e.preventDefault();
+        error.textContent = "";
+        let premier = null;
+        for (const [nom, c] of Object.entries(champs)) {
+          if (c.el.hidden) continue;
+          touches.add(nom);
+          const msg = verifs[nom]();
+          c.erreur(msg);
+          if (msg && !premier) premier = c.input;
+        }
+        if (premier) return premier.focus();
+
+        submit.disabled = true;
+        submit.textContent = "Création du compte…";
+        form.setAttribute("aria-busy", "true");
+        try {
+          state.me = await api("POST", "/web/signup", {
+            email: email.input.value.trim(),
+            password: pw.value,
+            invite: surInvitation ? invite.input.value.trim() : null,
+          });
+          // Le code d'invitation ne doit pas rester dans l'adresse.
+          history.replaceState(null, "", location.pathname);
+          allerA("accueil");
+        } catch (err) {
+          switch (err.code) {
+            case "email_taken":
+              email.erreur("Un compte existe déjà avec cette adresse.");
+              email.el.querySelector(".champ-erreur").append(
+                " ",
+                h("button", { type: "button", class: "bouton lien", onclick: () => afficher("connexion") }, "Se connecter"),
+              );
+              email.input.focus();
+              break;
+            case "invite_required":
+            case "invalid_invite":
+              invite.erreur(err.message);
+              invite.input.focus();
+              break;
+            default:
+              if (err.status === 400 && /mot de passe/i.test(err.message)) {
+                password.erreur(err.message);
+                pw.focus();
+              } else if (err.status === 400 && /adresse|e-mail/i.test(err.message)) {
+                email.erreur(err.message);
+                email.input.focus();
+              } else {
+                error.textContent =
+                  err.status === 429 ? "Trop de tentatives depuis cette connexion. Réessayez dans quelques minutes." : err.message;
+              }
+          }
+        } finally {
+          submit.disabled = false;
+          submit.textContent = "Créer mon compte";
+          form.removeAttribute("aria-busy");
+        }
+      },
+    },
+    h(
+      "header",
+      { class: "formulaire-titre" },
+      h("h2", { text: "Créer votre compte" }),
+      h("p", { class: "discret", text: "Un compte relie votre ordinateur et votre téléphone. Cela prend moins d'une minute." }),
+    ),
+    email.el,
+    password.el,
+    invite.el,
+    error,
+    submit,
+    h(
+      "p",
+      { class: "formulaire-pied discret" },
+      "Déjà un compte ? ",
+      h("button", { type: "button", class: "bouton lien", onclick: () => afficher("connexion") }, "Se connecter"),
+    ),
+  );
+  majSolidite();
+  return {
+    el: form,
+    focus: () => (surInvitation && !invite.input.value ? invite.input : email.input.value ? pw : email.input).focus(),
+  };
 }
 
 // ------------------------------------------------------------ espace

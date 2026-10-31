@@ -667,36 +667,166 @@ section.bloc,
   background: var(--carte);
 }
 
+.formulaire-corps {
+  display: grid;
+  gap: 28px;
+  width: 100%;
+  max-width: 400px;
+}
+
 .formulaire form {
   display: grid;
-  gap: 18px;
-  width: 100%;
-  max-width: 380px;
+  gap: 20px;
+}
+
+.formulaire-titre {
+  display: grid;
+  gap: 6px;
 }
 
 .formulaire h2 { font-size: 1.9rem; }
 
+.formulaire .bouton.principal {
+  min-height: 50px;
+  margin-top: 4px;
+}
+
+.formulaire-pied {
+  text-align: center;
+  font-size: 0.92rem;
+}
+
+.formulaire-pied .bouton.lien,
+.champ-erreur .bouton.lien {
+  padding: 2px 4px;
+  color: var(--bleu);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.formulaire-pied .bouton.lien:hover,
+.champ-erreur .bouton.lien:hover { color: var(--bleu-fonce); }
+
+/* Onglets Connexion / Inscription. */
 .bascule {
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 4px;
-  justify-self: start;
+  padding: 4px;
+  border-radius: 999px;
+  background: var(--carte-douce);
+  box-shadow: inset 0 0 0 1px var(--filet);
 }
 
 .bascule button {
-  min-height: 40px;
+  min-height: 42px;
   padding: 0 18px;
-  border: 1px solid var(--filet);
+  border: 0;
   border-radius: 999px;
-  background: var(--carte);
-  color: var(--encre);
+  background: transparent;
+  color: var(--gris);
+  font: inherit;
   cursor: pointer;
+  transition: background-color 150ms ease, color 150ms ease;
 }
 
-.bascule button[aria-pressed="true"] {
-  border-color: var(--encre);
+.bascule button:hover { color: var(--encre); }
+
+.bascule button[aria-selected="true"] {
   background: var(--encre);
   color: #ffffff;
 }
+
+.bascule button:focus-visible,
+.oeil:focus-visible {
+  outline: 2px solid var(--bleu);
+  outline-offset: 2px;
+}
+
+/* Champs : libellé, saisie, aide, erreur. */
+div.champ {
+  display: grid;
+  gap: 6px;
+}
+
+div.champ > label {
+  font-size: 0.85rem;
+  color: var(--gris);
+}
+
+.champ-aide {
+  font-size: 0.82rem;
+  color: var(--gris);
+}
+
+.champ-erreur {
+  font-size: 0.85rem;
+  color: var(--alerte);
+}
+
+.champ-erreur:empty { display: none; }
+
+input[aria-invalid="true"] {
+  border-color: var(--alerte);
+  background: rgba(229, 72, 77, 0.04);
+}
+
+input[aria-invalid="true"]:focus { border-color: var(--alerte); }
+
+.saisie {
+  position: relative;
+}
+
+.saisie input { padding-right: 52px; }
+
+.oeil {
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  translate: 0 -50%;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--gris);
+  cursor: pointer;
+}
+
+.oeil:hover { background: var(--lavande); color: var(--encre); }
+
+/* Solidité du mot de passe : quatre segments. */
+.solidite {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.82rem;
+  color: var(--gris);
+}
+
+.jauge {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  flex: none;
+  width: 112px;
+}
+
+.jauge span {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--filet);
+  transition: background-color 200ms ease;
+}
+
+.jauge[data-niveau="0"] span:nth-child(-n+1) { background: var(--alerte); }
+.jauge[data-niveau="1"] span:nth-child(-n+2) { background: var(--ambre); }
+.jauge[data-niveau="2"] span:nth-child(-n+3) { background: var(--bleu); }
+.jauge[data-niveau="3"] span { background: var(--vert); }
 
 /* ------------------------------------------------------------ espace */
 
