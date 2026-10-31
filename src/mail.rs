@@ -94,20 +94,30 @@ impl Mailer {
 
     /// Envoie un code d'invitation.
     pub async fn send_invite(&self, to: &str, code: &str, days: u32) -> Result<()> {
-        let where_ = match &self.public_url {
-            Some(url) => format!("Rendez-vous sur {url}, choisissez « Inscription »"),
-            None => "Dans l'application Cocon, choisissez « Inscription »".to_owned(),
-        };
-        let text = format!(
-            "Bonjour,\n\n\
-             Vous êtes invité·e à créer un compte Cocon.\n\n\
-             {where_} et saisissez ce code d'invitation :\n\n    {code}\n\n\
-             Il ne sert qu'une fois et reste valable {days} jours.\n\n\
-             Si vous n'attendiez pas cette invitation, ignorez simplement ce message.\n"
-        );
-        self.send(to, "Votre invitation à Cocon", text).await
+        self.send(to, "Votre invitation à Cocon", invite_text(self.public_url.as_deref(), code, days))
+            .await
     }
 }
+
+/// Texte de l'invitation. Avec l'adresse publique, un lien ouvre le
+/// formulaire d'inscription, code pré-rempli (`/?invite=CODE`).
+fn invite_text(public_url: Option<&str>, code: &str, days: u32) -> String {
+    let how = match public_url {
+        Some(url) => format!(
+            "Pour créer votre compte, ouvrez ce lien (le code est déjà rempli) :\n\n    {url}/?invite={code}\n\n\
+             Ou rendez-vous sur {url}, choisissez « Inscription » et saisissez ce code :"
+        ),
+        None => "Dans l'application Cocon, choisissez « Inscription » et saisissez ce code :".to_owned(),
+    };
+    format!(
+        "Bonjour,\n\n\
+         Vous êtes invité·e à créer un compte Cocon.\n\n\
+         {how}\n\n    {code}\n\n\
+         Il ne sert qu'une fois et reste valable {days} jours.\n\n\
+         Si vous n'attendiez pas cette invitation, ignorez simplement ce message.\n"
+    )
+}
+
 
 /// Contrôle minimal d'une adresse, avant de créer le code.
 pub fn looks_like_email(s: &str) -> bool {
@@ -139,6 +149,16 @@ mod tests {
         ] {
             assert!(!looks_like_email(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn lien_d_invitation() {
+        let t = super::invite_text(Some("https://cocon.tkcb.pro"), "ci_abc-_9", 7);
+        assert!(t.contains("https://cocon.tkcb.pro/?invite=ci_abc-_9"));
+        assert!(t.contains("7 jours"));
+        let t = super::invite_text(None, "ci_abc", 3);
+        assert!(!t.contains("?invite="));
+        assert!(t.contains("ci_abc"));
     }
 
     #[test]
