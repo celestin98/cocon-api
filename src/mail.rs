@@ -22,9 +22,15 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 const DEFAULT_FROM: &str = "Cocon <contact@tkcb.pro>";
 /// Messagerie Hostinger (boîte contact@tkcb.pro).
 const DEFAULT_HOST: &str = "smtp.hostinger.com";
+/// Durée maximale d'un envoi complet (connexion, TLS, authentification,
+/// message) : bien en deçà du délai des requêtes HTTP (30 s), pour qu'un
+/// serveur SMTP muet donne une erreur claire et non une requête coupée.
+const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Mailer {
     from: Mailbox,
+    /// « smtp.hostinger.com:465 (TLS) », pour les messages d'erreur.
+    server: String,
     public_url: Option<String>,
     transport: Transport,
 }
@@ -80,11 +86,13 @@ impl Mailer {
         let transport = builder
             .port(port)
             .credentials(Credentials::new(user, password))
-            .timeout(Some(Duration::from_secs(20)))
+            .timeout(Some(Duration::from_secs(10)))
             .build();
+        let server = format!("{host}:{port} ({})", if starttls { "STARTTLS" } else { "TLS" });
         let public_url = env("COCON_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_owned());
         Ok(Self {
             from,
+            server,
             public_url,
             transport: Transport::Smtp(transport),
         })
@@ -107,6 +115,7 @@ impl Mailer {
     fn fake(outbox: Option<Outbox>) -> Self {
         Self {
             from: DEFAULT_FROM.parse().expect("expéditeur par défaut"),
+            server: "mémoire".to_owned(),
             public_url: None,
             transport: Transport::Memory(outbox),
         }
@@ -124,9 +133,17 @@ impl Mailer {
             .body(text.clone())?;
         match &self.transport {
             Transport::Smtp(t) => {
-                t.send(message)
+                let server = &self.server;
+                tokio::time::timeout(SEND_TIMEOUT, t.send(message))
                     .await
-                    .context("le serveur SMTP a refusé l'envoi")?;
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "{server} ne répond pas (plus de {} s) : port sortant bloqué par \
+                             l'hébergeur, ou mauvais serveur/port ?",
+                            SEND_TIMEOUT.as_secs()
+                        )
+                    })?
+                    .with_context(|| format!("échec de l'envoi par {server}"))?;
             }
             #[cfg(test)]
             Transport::Memory(outbox) => {
@@ -141,6 +158,24 @@ impl Mailer {
             }
         }
         Ok(())
+    }
+
+    /// Serveur et expéditeur, pour le journal.
+    pub fn describe(&self) -> String {
+        format!("{} via {}", self.from, self.server)
+    }
+
+    /// Message d'essai (`cocon-api mail-test`).
+    pub async fn send_test(&self, to: &str) -> Result<()> {
+        self.send(
+            to,
+            "Test d'envoi Cocon",
+            format!(
+                "Ce message confirme que le serveur Cocon peut envoyer des e-mails ({}).\n",
+                self.server
+            ),
+        )
+        .await
     }
 
     /// Envoie le code de vérification de l'adresse (inscription).

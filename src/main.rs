@@ -64,6 +64,12 @@ enum Command {
         #[arg(long, env = "COCON_API_BIND", default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
     },
+    /// Envoie un e-mail d'essai pour vérifier la configuration SMTP
+    /// (affiche la cause exacte en cas d'échec).
+    MailTest {
+        /// Adresse destinataire.
+        to: String,
+    },
     /// Crée un code d'invitation (inscription en mode « invite »).
     Invite {
         /// Validité en jours.
@@ -167,7 +173,7 @@ async fn user_or_fail(db: &Db, email: &str) -> Result<db::UserRow> {
 
 async fn admin(db: &Db, command: Command) -> Result<()> {
     match command {
-        Command::Serve { .. } | Command::Health { .. } => unreachable!(),
+        Command::Serve { .. } | Command::Health { .. } | Command::MailTest { .. } => unreachable!(),
         Command::User { command } => match command {
             UserCommand::Add { email } => {
                 let email = email.trim().to_lowercase();
@@ -327,6 +333,7 @@ async fn serve(
             "inscription libre (COCON_API_SIGNUP=open) : configurez l'envoi des codes par e-mail \
              (COCON_SMTP_PASSWORD, voir README), ou choisissez COCON_API_SIGNUP=invite ou closed",
         )?;
+        tracing::info!("e-mails : {}", m.describe());
         Some(std::sync::Arc::new(m))
     } else {
         None
@@ -432,6 +439,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Command::Health { bind } = cli.command {
         return health(bind);
+    }
+    if let Command::MailTest { to } = &cli.command {
+        let mailer = mail::Mailer::from_env()?;
+        println!("Envoi d'un e-mail d'essai à {to} ({})…", mailer.describe());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        rt.block_on(mailer.send_test(to.trim()))?;
+        println!("Envoyé : vérifiez la boîte de réception (et les indésirables).");
+        return Ok(());
     }
     let Some(url) = cli.database_url else {
         bail!("DATABASE_URL manquant (variable d'environnement ou fichier .env)");

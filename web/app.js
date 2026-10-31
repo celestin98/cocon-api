@@ -571,6 +571,20 @@ function formInscription(partage, afficher, codeInvite) {
           history.replaceState(null, "", location.pathname);
           allerA("accueil");
         } catch (err) {
+          if (err.code === "email_taken") {
+            // Inscription déjà commencée (code jamais saisi, envoi coupé…) :
+            // avec le même mot de passe, on reprend à l'étape du code.
+            try {
+              state.me = await api("POST", "/web/login", { email: email.input.value.trim(), password: pw.value, totp: null });
+              history.replaceState(null, "", location.pathname);
+              return allerA("accueil");
+            } catch (e) {
+              if (e.code === "email_unverified") {
+                partage.email = email.input.value.trim();
+                return afficher("verification");
+              }
+            }
+          }
           switch (err.code) {
             case "email_taken":
               email.erreur("Un compte existe déjà avec cette adresse.");
