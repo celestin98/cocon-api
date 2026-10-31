@@ -83,20 +83,28 @@ Inscriptions (`COCON_API_SIGNUP` dans `.env`, ou `--signup`) :
 
 | Mode | Effet |
 |---|---|
-| `open` (par défaut) | tout le monde peut créer un compte ; l'adresse est confirmée par un code à 6 chiffres envoyé par e-mail (SMTP obligatoire, voir ci-dessous) ; chaque compte ne voit que ses propres PC |
+| `open` (par défaut) | tout le monde peut créer un compte ; l'adresse est confirmée par un code à 6 chiffres envoyé par e-mail (envoi d'e-mails obligatoire : Resend ou SMTP, voir ci-dessous) ; chaque compte ne voit que ses propres PC |
 | `invite` | un code est demandé : `cocon-api invite --days 7` en crée un, à usage unique |
 | `closed` | inscriptions fermées ; comptes créés en ligne de commande |
 
 Pour un serveur personnel, `invite` ou `closed` une fois votre compte créé.
 
-**Envoi d'e-mails (SMTP).** En mode `open`, l'inscription se fait en deux
+**Envoi d'e-mails.** En mode `open`, l'inscription se fait en deux
 étapes : e-mail et mot de passe, puis le code à 6 chiffres reçu par e-mail
 (valable 10 minutes, 5 essais, renvoi possible après une minute, 5 envois au
 plus). Sans confirmation, le compte ne peut pas se connecter et il est supprimé
 au bout de 24 h. Le serveur refuse de démarrer en mode `open` si le SMTP n'est
 pas configuré. Le même SMTP sert à `cocon-api invite --email ami@exemple.org`.
 
-Renseignez dans `.env` le SMTP de la boîte expéditrice (Hostinger par défaut) :
+Deux façons d'envoyer, au choix :
+
+- **Resend** (recommandé) : `RESEND_API_KEY` (clé [Resend](https://resend.com)),
+  avec le domaine de l'expéditeur vérifié chez Resend. L'envoi passe par HTTPS
+  (port 443), jamais bloqué par les hébergeurs. Si la clé est définie, le SMTP
+  est ignoré.
+- **SMTP** : beaucoup de VPS bloquent les ports SMTP sortants (465, 587).
+
+Pour le SMTP, renseignez dans `.env` la boîte expéditrice (Hostinger par défaut) :
 `COCON_SMTP_PASSWORD` (mot de passe de `contact@tkcb.pro`) et, si besoin,
 `COCON_SMTP_HOST` (par défaut `smtp.hostinger.com`),
 `COCON_SMTP_PORT` (465 en TLS direct, par défaut, ou 587 en STARTTLS),

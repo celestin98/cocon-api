@@ -1,7 +1,9 @@
-//! Envoi d'e-mails en SMTP, directement auprès du serveur de messagerie
-//! de l'expéditeur (aucun service tiers).
+//! Envoi d'e-mails : par l'API de Resend (HTTPS) si `RESEND_API_KEY` est
+//! défini, sinon en SMTP auprès du serveur de messagerie de l'expéditeur.
 //!
 //! Configuration (`.env`) :
+//! - `RESEND_API_KEY` : clé d'API Resend (secret) ; le domaine de
+//!   l'expéditeur doit être vérifié chez Resend ;
 //! - `COCON_SMTP_HOST` : serveur SMTP (par défaut `smtp.hostinger.com`) ;
 //! - `COCON_SMTP_PORT` : port, 465 (TLS direct, par défaut) ou 587 (STARTTLS) ;
 //! - `COCON_SMTP_TLS` : `tls` ou `starttls` (déduit du port s'il est absent) ;
@@ -36,7 +38,11 @@ pub struct Mailer {
     transport: Transport,
 }
 
+const RESEND_URL: &str = "https://api.resend.com/emails";
+
 enum Transport {
+    /// API HTTPS de Resend (port 443 : jamais bloqué, contrairement au SMTP).
+    Resend { api_key: String, http: reqwest::Client },
     Smtp(SmtpConfig),
     /// Tests : messages gardés en mémoire (`None` : envoi en échec).
     #[cfg(test)]
@@ -95,9 +101,21 @@ impl Mailer {
         let from: Mailbox = from_raw
             .parse()
             .with_context(|| format!("COCON_MAIL_FROM invalide : {from_raw}"))?;
+        let public_url = env("COCON_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_owned());
+        if let Some(api_key) = env("RESEND_API_KEY") {
+            let http = reqwest::Client::builder().timeout(SEND_TIMEOUT).build()?;
+            return Ok(Self {
+                from,
+                server: "Resend (API HTTPS)".to_owned(),
+                public_url,
+                transport: Transport::Resend { api_key, http },
+            });
+        }
         let host = env("COCON_SMTP_HOST").unwrap_or_else(|| DEFAULT_HOST.to_owned());
-        let password = env("COCON_SMTP_PASSWORD")
-            .context("COCON_SMTP_PASSWORD manquant (variable d'environnement ou fichier .env)")?;
+        let password = env("COCON_SMTP_PASSWORD").context(
+            "aucun envoi d'e-mails configuré : RESEND_API_KEY (Resend) ou COCON_SMTP_PASSWORD (SMTP) \
+             manquant (variable d'environnement ou fichier .env)",
+        )?;
         let user = env("COCON_SMTP_USER").unwrap_or_else(|| from.email.to_string());
         let port: u16 = match env("COCON_SMTP_PORT") {
             Some(p) => p
@@ -119,7 +137,6 @@ impl Mailer {
             credentials: Credentials::new(user, password),
         };
         let server = format!("{host}:{port} ({})", if starttls { "STARTTLS" } else { "TLS" });
-        let public_url = env("COCON_PUBLIC_URL").map(|u| u.trim_end_matches('/').to_owned());
         Ok(Self {
             from,
             server,
@@ -162,6 +179,29 @@ impl Mailer {
             .header(ContentType::TEXT_PLAIN)
             .body(text.clone())?;
         match &self.transport {
+            Transport::Resend { api_key, http } => {
+                let _ = message;
+                let resp = http
+                    .post(RESEND_URL)
+                    .bearer_auth(api_key)
+                    .json(&serde_json::json!({
+                        "from": self.from.to_string(),
+                        "to": [to.email.to_string()],
+                        "subject": subject,
+                        "text": text,
+                    }))
+                    .send()
+                    .await
+                    .context("Resend injoignable")?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!(
+                        "Resend a refusé l'envoi ({status}) : {}",
+                        body.chars().take(500).collect::<String>()
+                    );
+                }
+            }
             Transport::Smtp(config) => {
                 let server = &self.server;
                 let send = async {

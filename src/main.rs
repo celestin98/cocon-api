@@ -340,7 +340,7 @@ async fn serve(
     let mailer = if signup == protocol::SignupMode::Open {
         let m = mail::Mailer::from_env().context(
             "inscription libre (COCON_API_SIGNUP=open) : configurez l'envoi des codes par e-mail \
-             (COCON_SMTP_PASSWORD, voir README), ou choisissez COCON_API_SIGNUP=invite ou closed",
+             (RESEND_API_KEY ou COCON_SMTP_PASSWORD, voir README), ou choisissez COCON_API_SIGNUP=invite ou closed",
         )?;
         tracing::info!("e-mails : {}", m.describe());
         Some(std::sync::Arc::new(m))
@@ -445,6 +445,9 @@ fn main() -> Result<()> {
     // Secrets dans `.env` (jamais dans la ligne de commande : visible de
     // tous dans la liste des processus).
     let _ = dotenvy::dotenv();
+    // TLS des appels HTTPS (Resend) : même moteur cryptographique (ring) que
+    // la base et le SMTP.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     if let Command::Health { bind } = cli.command {
         return health(bind);
