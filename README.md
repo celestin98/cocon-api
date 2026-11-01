@@ -276,6 +276,13 @@ L'arrêt respecte la friction choisie sur le PC. Premier appel avec
 `device_id` est facultatif s'il n'y a qu'un PC en ligne. Erreurs : `no_agent`,
 `offline`, `ambiguous`, `timeout`.
 
+**Téléphone.** Avec le `device_id` d'un téléphone, `POST /v1/session/start`
+lui envoie l'événement `start_focus` sur son flux `/v1/events` et répond
+aussitôt `{"outcome": "done"}` ; `offline` si le téléphone n'a pas de flux
+ouvert. Le téléphone démarre alors une session locale, sauf si l'utilisateur
+a désactivé « Démarrage à distance ». Dans `GET /v1/devices`, `online` vaut
+`true` pour un téléphone dont le flux est ouvert.
+
 ### Réglages et tâches
 
 Versionnés : toute écriture indique la version lue ; `409 conflict` si elle a
@@ -328,6 +335,7 @@ l'état de chaque PC, puis à chaque changement :
 {"type": "config_changed", "version": 4}
 {"type": "tasks_changed", "version": 9}
 {"type": "devices_changed"}
+{"type": "start_focus", "device_id": "…", "minutes": 25, "from": "Navigateur"}
 {"type": "hydration_reminder", "today": 3, "goal": 8, "today_ml": 750, "goal_ml": 2000}
 {"type": "hydration_changed", "settings": {…}, "today": 4, "today_ml": 1000, "last_drink": "…", "next_reminder": "…", "configured": true}
 ```

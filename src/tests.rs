@@ -594,6 +594,65 @@ async fn agent_relays_commands_and_status_in_real_time() {
     ));
 }
 
+#[tokio::test]
+async fn phone_session_can_be_started_remotely() {
+    let Some((app, _)) = setup().await else {
+        return;
+    };
+    let addr = spawn_server(app.clone()).await;
+    let pc = login(&app, "desktop").await;
+    let phone = login(&app, "mobile").await;
+    let (pct, pt) = (tok(&pc, "access_token"), tok(&phone, "access_token"));
+    let phone_id = tok(&phone, "device_id");
+
+    // Téléphone sans flux ouvert : injoignable.
+    let (s, v) = http(addr, "POST", "/v1/session/start", &pct, json!({"device_id": phone_id})).await;
+    assert_eq!((s, v["error"].as_str()), (409, Some("offline")));
+
+    let mut events = ws_connect(addr, "/v1/events", &pt).await.unwrap();
+    // Le téléphone apparaît en ligne dès que son flux est ouvert.
+    let mut online = false;
+    for _ in 0..50 {
+        let (_, list) = http(addr, "GET", "/v1/devices", &pct, json!({})).await;
+        online = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == phone_id.as_str() && d["online"] == true);
+        if online {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(online);
+
+    let (s, v) = http(
+        addr,
+        "POST",
+        "/v1/session/start",
+        &pct,
+        json!({"device_id": phone_id, "minutes": 25}),
+    )
+    .await;
+    assert_eq!((s, v["outcome"].as_str()), (200, Some("done")), "{v}");
+    let ev = next_of_type(&mut events, "start_focus").await;
+    assert_eq!(ev["device_id"], phone_id.as_str());
+    assert_eq!(ev["minutes"], 25);
+    assert_eq!(ev["from"], "Test");
+
+    drop(events);
+    let mut gone = false;
+    for _ in 0..50 {
+        let (s, _) = http(addr, "POST", "/v1/session/start", &pct, json!({"device_id": phone_id})).await;
+        if s == 409 {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(gone, "le téléphone déconnecté doit redevenir injoignable");
+}
+
 // ------------------------------------------------------------ hydratation
 
 async fn next_of_type(ws: &mut Ws, kind: &str) -> Value {

@@ -40,7 +40,11 @@ async fn close(mut socket: WebSocket, reason: &'static str) {
 
 pub async fn events(State(state): State<AppState>, Auth(a): Auth, ws: WebSocketUpgrade) -> Response {
     ws.max_message_size(16 * 1024)
-        .on_upgrade(move |socket| events_loop(state, a.user_id, a.device_id, socket))
+        .on_upgrade(move |socket| async move {
+            state.hub.listen(a.user_id, &a.device_id);
+            events_loop(state.clone(), a.user_id, a.device_id.clone(), socket).await;
+            state.hub.unlisten(a.user_id, &a.device_id);
+        })
 }
 
 async fn device_valid(state: &AppState, device: &str) -> bool {

@@ -989,11 +989,12 @@ async function vueAccueil(view) {
   const zone = h("div", { class: "tableau" });
   view.append(zone);
   try {
-    const [sessions, config, tasks, eau] = await Promise.all([
+    const [sessions, config, tasks, eau, appareils] = await Promise.all([
       api("GET", "/v1/session"),
       api("GET", "/v1/config").catch(() => null),
       api("GET", "/v1/tasks").catch(() => null),
       api("GET", "/v1/hydration").catch(() => null),
+      api("GET", "/v1/devices").catch(() => null),
     ]);
     if (config) state.config = config;
     if (tasks) state.tasks = tasks;
@@ -1007,6 +1008,8 @@ async function vueAccueil(view) {
     sessionPanels.clear();
     if (pcs.length === 0) zone.append(bienvenue());
     for (const v of pcs) zone.append(panneauPc(v));
+    const telephones = (appareils ?? []).filter((d) => d.kind === "mobile");
+    if (telephones.length) zone.append(carteTelephones(telephones));
     const taches = carteTaches();
     const bilan = carteBilan();
     cartesTaches = { taches, bilan };
@@ -1018,6 +1021,47 @@ async function vueAccueil(view) {
   } catch (err) {
     zone.append(h("p", { class: "erreur pleine", text: err.message }));
   }
+}
+
+/// Téléphones du compte : démarrer leur concentration à distance.
+function carteTelephones(telephones) {
+  const sess = state.config?.config?.session ?? {};
+  const defaut = sess.default_minutes ?? 90;
+  return h("article", { class: "carte" },
+    h("h2", { text: telephones.length > 1 ? "Téléphones" : "Téléphone" }),
+    h("p", { class: "discret", text: "Démarrez la concentration du téléphone depuis ici : les applications non autorisées y sont masquées par l'écran « Pas maintenant », sans être fermées." }),
+    h("ul", { class: "lignes" },
+      telephones.map((d) => {
+        const minutes = h("input", { type: "number", min: 1, max: 1440, value: defaut, "aria-label": `Durée en minutes pour ${d.name}` });
+        const erreur = h("p", { class: "erreur", role: "alert" });
+        const bouton = h("button", { class: "bouton principal", type: "submit", disabled: !d.online }, "Démarrer");
+        return h("li", {},
+          h("div", { class: "texte" },
+            h("div", { text: d.name }),
+            h("span", { class: `puce point${d.online ? " vert" : ""}`, text: d.online ? "En ligne" : "Hors ligne" }),
+          ),
+          h("form", {
+            class: "rangee",
+            onsubmit: async (e) => {
+              e.preventDefault();
+              erreur.textContent = "";
+              bouton.disabled = true;
+              bouton.textContent = "Envoi…";
+              try {
+                await api("POST", "/v1/session/start", { minutes: Number(minutes.value), device_id: d.id });
+                bouton.textContent = "Envoyé ✓";
+              } catch (err) {
+                erreur.textContent = err.message;
+                bouton.textContent = "Démarrer";
+              }
+              setTimeout(() => { bouton.disabled = false; bouton.textContent = "Démarrer"; }, 2500);
+            },
+          }, h("label", { class: "champ" }, "Durée (minutes)", minutes), bouton),
+          erreur,
+        );
+      }),
+    ),
+  );
 }
 
 /// Une commande à copier en un clic.
@@ -2043,7 +2087,7 @@ async function carteAppareils(col) {
               h("div", { class: "discret petit", text: genre[d.kind] ?? d.kind }),
             ),
             h("span", { class: "quand", text: d.kind === "desktop" ? "" : `vu ${quand(d.last_seen)}` }),
-            d.kind === "desktop"
+            d.kind !== "web"
               ? h("span", { class: `puce point${d.online ? " vert" : ""}`, text: d.online ? "Connecté" : "Déconnecté" })
               : h("span", { class: `puce point${d.current ? " vert" : ""}`, text: d.current ? "Vous êtes ici" : "Session web" }),
             d.current

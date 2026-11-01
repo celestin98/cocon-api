@@ -518,7 +518,8 @@ async fn devices(State(state): State<AppState>, Auth(a): Auth) -> ApiResult<Json
     Ok(Json(
         rows.into_iter()
             .map(|d| DeviceInfo {
-                online: state.hub.is_online(uid, &d.id),
+                online: state.hub.is_online(uid, &d.id)
+                    || (d.kind == DeviceKind::Mobile && state.hub.is_listening(uid, &d.id)),
                 current: d.id == a.device_id,
                 id: d.id,
                 name: d.name,
@@ -864,6 +865,14 @@ async fn start(
     if req.minutes.is_some_and(|m| !(1..=1440).contains(&m)) {
         return Err(Error::bad_request("durée entre 1 et 1440 minutes"));
     }
+    if let Some(id) = &req.device_id
+        && let Some(d) = db::device(&state.db, id).await?
+        && d.user_id == a.user_id
+        && !d.revoked
+        && d.kind == DeviceKind::Mobile
+    {
+        return start_phone(&state, ip, &a, d, req.minutes).await;
+    }
     let pc = pick_desktop(&state, a.user_id, req.device_id).await?;
     audit(
         &state,
@@ -879,6 +888,45 @@ async fn start(
         .await
         .map_err(command_error)?;
     outcome_response(outcome)
+}
+
+/// Démarrage à distance sur un téléphone : il reçoit l'ordre sur son flux
+/// d'événements et démarre une session locale (s'il l'autorise).
+async fn start_phone(
+    state: &AppState,
+    ip: IpAddr,
+    a: &Authenticated,
+    phone: DeviceRow,
+    minutes: Option<u32>,
+) -> ApiResult<Json<CommandOutcome>> {
+    if !state.hub.is_listening(a.user_id, &phone.id) {
+        return Err(Error::new(
+            StatusCode::CONFLICT,
+            "offline",
+            "Ce téléphone n'est pas connecté",
+        ));
+    }
+    audit(
+        state,
+        Some(a.user_id),
+        Some(a.device_id.clone()),
+        ip,
+        "session_start",
+        phone.id.clone(),
+    );
+    let from = db::device(&state.db, &a.device_id)
+        .await?
+        .map(|d| d.name)
+        .unwrap_or_default();
+    state.hub.publish(
+        a.user_id,
+        ClientEvent::StartFocus {
+            device_id: phone.id,
+            minutes,
+            from,
+        },
+    );
+    Ok(Json(CommandOutcome::Done))
 }
 
 async fn stop(

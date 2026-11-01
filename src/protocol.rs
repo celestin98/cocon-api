@@ -385,6 +385,13 @@ pub enum ClientEvent {
         version: u64,
     },
     DevicesChanged,
+    /// Démarrer la concentration sur ce téléphone (demandé depuis le web
+    /// ou un autre appareil). Seul l'appareil `device_id` en tient compte.
+    StartFocus {
+        device_id: String,
+        minutes: Option<u32>,
+        from: String,
+    },
     /// C'est l'heure de boire un verre d'eau.
     HydrationReminder {
         today: u32,

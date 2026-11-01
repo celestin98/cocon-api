@@ -35,6 +35,8 @@ struct UserHub {
     agents: HashMap<String, AgentConn>,
     pending: HashMap<String, oneshot::Sender<CommandOutcome>>,
     status: HashMap<String, (Option<Value>, DateTime<Utc>)>,
+    /// Flux d'événements ouverts, par appareil (téléphones joignables).
+    listeners: HashMap<String, usize>,
 }
 
 impl UserHub {
@@ -44,6 +46,7 @@ impl UserHub {
             agents: HashMap::new(),
             pending: HashMap::new(),
             status: HashMap::new(),
+            listeners: HashMap::new(),
         }
     }
 }
@@ -68,6 +71,28 @@ impl Hub {
         self.with(user, |u| {
             let _ = u.events.send(ev);
         });
+    }
+
+    /// Un client ouvre son flux d'événements.
+    pub fn listen(&self, user: i64, device: &str) {
+        self.with(user, |u| *u.listeners.entry(device.to_owned()).or_insert(0) += 1);
+    }
+
+    /// Un client ferme son flux d'événements.
+    pub fn unlisten(&self, user: i64, device: &str) {
+        self.with(user, |u| {
+            if let Some(n) = u.listeners.get_mut(device) {
+                *n -= 1;
+                if *n == 0 {
+                    u.listeners.remove(device);
+                }
+            }
+        });
+    }
+
+    /// L'appareil a au moins un flux d'événements ouvert.
+    pub fn is_listening(&self, user: i64, device: &str) -> bool {
+        self.with(user, |u| u.listeners.contains_key(device))
     }
 
     /// Enregistre le connecteur d'un PC (remplace une connexion précédente).
@@ -97,6 +122,7 @@ impl Hub {
         self.with(user, |u| {
             u.agents.remove(device);
             u.status.remove(device);
+            u.listeners.remove(device);
         });
     }
 
